@@ -227,6 +227,22 @@ public sealed class ReplicationManager
         get { lock (_gate) return _followOffset; }
     }
 
+    private int _followDb;
+
+    /// <summary>
+    /// The logical database the follow position has reached: the
+    /// stream's SELECT frames move it, and it survives reconnects, so a
+    /// partial resync resumes applying frames in the right database
+    /// without the primary re-framing anything. A full sync resets it —
+    /// the snapshot carries every entry's database itself, and the
+    /// primary frames the next effect with an explicit SELECT.
+    /// </summary>
+    public int FollowDb
+    {
+        get { lock (_gate) return _followDb; }
+        set { lock (_gate) _followDb = value; }
+    }
+
     public bool MasterLinkUp
     {
         get { lock (_gate) return _masterLinkUp; }
@@ -297,6 +313,7 @@ public sealed class ReplicationManager
             _backlogFirstByteOffset = offset;
             _followReplId = replId;
             _followOffset = offset;
+            _followDb = 0;
         }
     }
 

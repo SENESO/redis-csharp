@@ -17,7 +17,8 @@ public sealed record ExportedEntry(
     byte[] Key,
     RedisType Type,
     object Value,
-    DateTimeOffset? ExpiresAt);
+    DateTimeOffset? ExpiresAt,
+    int Db = 0);
 
 public sealed partial class RedisStore
 {
@@ -44,11 +45,11 @@ public sealed partial class RedisStore
     // Sets
     // ------------------------------------------------------------------
 
-    public long SetAdd(byte[] key, IReadOnlyList<byte[]> members)
+    public long SetAdd(byte[] key, IReadOnlyList<byte[]> members, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetOrCreate(key, RedisType.Set, () => new HashSet<byte[]>(ByteArrayComparer.Instance));
+            var entry = GetOrCreate(key, db, RedisType.Set, () => new HashSet<byte[]>(ByteArrayComparer.Instance));
             var set = (HashSet<byte[]>)entry.Value;
             long added = 0;
             foreach (var member in members)
@@ -63,11 +64,11 @@ public sealed partial class RedisStore
         }
     }
 
-    public long SetRemove(byte[] key, IReadOnlyList<byte[]> members)
+    public long SetRemove(byte[] key, IReadOnlyList<byte[]> members, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Set);
+            var entry = GetTyped(key, db, RedisType.Set);
             if (entry is null)
                 return 0;
             var set = (HashSet<byte[]>)entry.Value;
@@ -80,34 +81,34 @@ public sealed partial class RedisStore
                     removed++;
                 }
             }
-            RemoveIfEmpty(key, entry);
+            RemoveIfEmpty(key, db, entry);
             return removed;
         }
     }
 
-    public bool SetIsMember(byte[] key, byte[] member)
+    public bool SetIsMember(byte[] key, byte[] member, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Set);
+            var entry = GetTyped(key, db, RedisType.Set);
             return entry is not null && ((HashSet<byte[]>)entry.Value).Contains(member);
         }
     }
 
-    public long SetCard(byte[] key)
+    public long SetCard(byte[] key, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Set);
+            var entry = GetTyped(key, db, RedisType.Set);
             return entry is null ? 0 : ((HashSet<byte[]>)entry.Value).Count;
         }
     }
 
-    public IReadOnlyList<byte[]> SetMembers(byte[] key)
+    public IReadOnlyList<byte[]> SetMembers(byte[] key, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Set);
+            var entry = GetTyped(key, db, RedisType.Set);
             if (entry is null)
                 return Array.Empty<byte[]>();
             var members = new List<byte[]>(((HashSet<byte[]>)entry.Value));
@@ -120,11 +121,11 @@ public sealed partial class RedisStore
     // Hashes
     // ------------------------------------------------------------------
 
-    public long HashSet(byte[] key, IReadOnlyList<KeyValuePair<byte[], byte[]>> pairs)
+    public long HashSet(byte[] key, IReadOnlyList<KeyValuePair<byte[], byte[]>> pairs, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetOrCreate(key, RedisType.Hash, () => new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance));
+            var entry = GetOrCreate(key, db, RedisType.Hash, () => new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance));
             var hash = (Dictionary<byte[], byte[]>)entry.Value;
             long added = 0;
             foreach (var (field, value) in pairs)
@@ -144,22 +145,22 @@ public sealed partial class RedisStore
         }
     }
 
-    public byte[]? HashGet(byte[] key, byte[] field)
+    public byte[]? HashGet(byte[] key, byte[] field, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Hash);
+            var entry = GetTyped(key, db, RedisType.Hash);
             if (entry is null)
                 return null;
             return ((Dictionary<byte[], byte[]>)entry.Value).GetValueOrDefault(field);
         }
     }
 
-    public long HashDelete(byte[] key, IReadOnlyList<byte[]> fields)
+    public long HashDelete(byte[] key, IReadOnlyList<byte[]> fields, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Hash);
+            var entry = GetTyped(key, db, RedisType.Hash);
             if (entry is null)
                 return 0;
             var hash = (Dictionary<byte[], byte[]>)entry.Value;
@@ -172,16 +173,16 @@ public sealed partial class RedisStore
                     removed++;
                 }
             }
-            RemoveIfEmpty(key, entry);
+            RemoveIfEmpty(key, db, entry);
             return removed;
         }
     }
 
-    public IReadOnlyList<KeyValuePair<byte[], byte[]>> HashGetAll(byte[] key)
+    public IReadOnlyList<KeyValuePair<byte[], byte[]>> HashGetAll(byte[] key, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Hash);
+            var entry = GetTyped(key, db, RedisType.Hash);
             if (entry is null)
                 return Array.Empty<KeyValuePair<byte[], byte[]>>();
             var pairs = new List<KeyValuePair<byte[], byte[]>>(((Dictionary<byte[], byte[]>)entry.Value));
@@ -190,11 +191,11 @@ public sealed partial class RedisStore
         }
     }
 
-    public long HashLength(byte[] key)
+    public long HashLength(byte[] key, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.Hash);
+            var entry = GetTyped(key, db, RedisType.Hash);
             return entry is null ? 0 : ((Dictionary<byte[], byte[]>)entry.Value).Count;
         }
     }
@@ -204,11 +205,11 @@ public sealed partial class RedisStore
     // ------------------------------------------------------------------
 
     public ZAddResult ZAdd(byte[] key, ZAddMode mode, bool countChanged, bool increment,
-        IReadOnlyList<(double Score, byte[] Member)> items, bool requireExisting = false)
+        IReadOnlyList<(double Score, byte[] Member)> items, bool requireExisting = false, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetOrCreate(key, RedisType.ZSet, () => new ZSetValue());
+            var entry = GetOrCreate(key, db, RedisType.ZSet, () => new ZSetValue());
             var zset = (ZSetValue)entry.Value;
 
             if (increment)
@@ -220,7 +221,7 @@ public sealed partial class RedisStore
                     // A declined INCR on a missing key must not leave the
                     // just-created empty entry behind (real Redis creates
                     // nothing); the non-increment path already cleans up.
-                    RemoveIfEmpty(key, entry);
+                    RemoveIfEmpty(key, db, entry);
                     return new ZAddResult(0, 0, null);
                 }
                 if (exists && mode == ZAddMode.OnlyNew)
@@ -267,7 +268,7 @@ public sealed partial class RedisStore
                     changed++;
                 }
             }
-            RemoveIfEmpty(key, entry);
+            RemoveIfEmpty(key, db, entry);
             return new ZAddResult(countChanged ? added + changed : added, changed, null);
         }
     }
@@ -280,22 +281,22 @@ public sealed partial class RedisStore
         zset.Sorted.Add(new ZSetNode(score, member));
     }
 
-    public double? ZScore(byte[] key, byte[] member)
+    public double? ZScore(byte[] key, byte[] member, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.ZSet);
+            var entry = GetTyped(key, db, RedisType.ZSet);
             if (entry is null)
                 return null;
             return ((ZSetValue)entry.Value).Scores.TryGetValue(member, out var score) ? score : null;
         }
     }
 
-    public IReadOnlyList<(byte[] Member, double Score)> ZRange(byte[] key, long start, long stop)
+    public IReadOnlyList<(byte[] Member, double Score)> ZRange(byte[] key, long start, long stop, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.ZSet);
+            var entry = GetTyped(key, db, RedisType.ZSet);
             if (entry is null)
                 return Array.Empty<(byte[], double)>();
             var zset = (ZSetValue)entry.Value;
@@ -315,11 +316,11 @@ public sealed partial class RedisStore
         }
     }
 
-    public long ZRemove(byte[] key, IReadOnlyList<byte[]> members)
+    public long ZRemove(byte[] key, IReadOnlyList<byte[]> members, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.ZSet);
+            var entry = GetTyped(key, db, RedisType.ZSet);
             if (entry is null)
                 return 0;
             var zset = (ZSetValue)entry.Value;
@@ -334,16 +335,16 @@ public sealed partial class RedisStore
                     removed++;
                 }
             }
-            RemoveIfEmpty(key, entry);
+            RemoveIfEmpty(key, db, entry);
             return removed;
         }
     }
 
-    public long ZCard(byte[] key)
+    public long ZCard(byte[] key, int db = 0)
     {
         lock (_gate)
         {
-            var entry = GetTyped(key, RedisType.ZSet);
+            var entry = GetTyped(key, db, RedisType.ZSet);
             return entry is null ? 0 : ((ZSetValue)entry.Value).Scores.Count;
         }
     }
@@ -353,8 +354,9 @@ public sealed partial class RedisStore
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Deep-copies the whole keyspace in deterministic (sorted key) order.
-    /// Value shapes: string → byte[]; list → List&lt;byte[]&gt; head-to-tail;
+    /// Deep-copies the whole keyspace in deterministic order: databases
+    /// in index order, keys sorted within each database. Value shapes:
+    /// string → byte[]; list → List&lt;byte[]&gt; head-to-tail;
     /// set → List&lt;byte[]&gt; sorted; hash → field/value pairs sorted by
     /// field; zset → (member, score) pairs in rank order.
     /// </summary>
@@ -363,23 +365,27 @@ public sealed partial class RedisStore
         lock (_gate)
         {
             PurgeExpiredLocked();
-            var keys = new List<byte[]>(_data.Keys);
-            keys.Sort(ByteArrayComparer.Instance);
-            var result = new List<ExportedEntry>(keys.Count);
-            foreach (var key in keys)
+            var result = new List<ExportedEntry>();
+            for (var db = 0; db < _dbs.Length; db++)
             {
-                var entry = _data[key];
-                object value = entry.Type switch
+                var table = _dbs[db];
+                var keys = new List<byte[]>(table.Keys);
+                keys.Sort(ByteArrayComparer.Instance);
+                foreach (var key in keys)
                 {
-                    RedisType.String => (byte[])((byte[])entry.Value).Clone(),
-                    RedisType.List => new List<byte[]>((LinkedList<byte[]>)entry.Value),
-                    RedisType.Set => SortedCopy((HashSet<byte[]>)entry.Value),
-                    RedisType.Hash => SortedPairs((Dictionary<byte[], byte[]>)entry.Value),
-                    RedisType.ZSet => ((ZSetValue)entry.Value).Sorted
-                        .Select(n => new KeyValuePair<byte[], double>(n.Member, n.Score)).ToList(),
-                    _ => throw new InvalidOperationException($"Unknown entry type {entry.Type}")
-                };
-                result.Add(new ExportedEntry(key, entry.Type, value, entry.ExpiresAt));
+                    var entry = table[key];
+                    object value = entry.Type switch
+                    {
+                        RedisType.String => (byte[])((byte[])entry.Value).Clone(),
+                        RedisType.List => new List<byte[]>((LinkedList<byte[]>)entry.Value),
+                        RedisType.Set => SortedCopy((HashSet<byte[]>)entry.Value),
+                        RedisType.Hash => SortedPairs((Dictionary<byte[], byte[]>)entry.Value),
+                        RedisType.ZSet => ((ZSetValue)entry.Value).Sorted
+                            .Select(n => new KeyValuePair<byte[], double>(n.Member, n.Score)).ToList(),
+                        _ => throw new InvalidOperationException($"Unknown entry type {entry.Type}")
+                    };
+                    result.Add(new ExportedEntry(key, entry.Type, value, entry.ExpiresAt, db));
+                }
             }
             return result;
         }
@@ -415,10 +421,12 @@ public sealed partial class RedisStore
                 RedisType.ZSet => BuildZSet((List<KeyValuePair<byte[], double>>)exported.Value),
                 _ => throw new InvalidOperationException($"Unknown entry type {exported.Type}")
             };
-            if (_data.TryGetValue(exported.Key, out var replaced))
+            if (Table(exported.Db).TryGetValue(exported.Key, out var replaced))
                 _usedMemory -= EstimateEntrySize(exported.Key, replaced);
             var entry = new RedisEntry { Type = exported.Type, Value = value, ExpiresAt = exported.ExpiresAt };
-            _data[exported.Key] = entry;
+            entry.FreqCounter = LfuInitialCounter; // imports start cold, as a fresh key would
+            entry.FreqMinute = CurrentMinute();
+            Table(exported.Db)[exported.Key] = entry;
             _usedMemory += EstimateEntrySize(exported.Key, entry);
         }
     }

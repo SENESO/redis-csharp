@@ -40,14 +40,14 @@ public sealed partial class CommandProcessor
     private readonly ReplicationManager _replication;
     private readonly int _port;
     private readonly int _tlsPort;
-    private readonly byte[]? _requirePass;
+    private readonly AclManager _acl;
     private readonly DateTimeOffset _startedAt;
     private readonly object _gate = new();
     private int _backgroundSaveRunning;
 
     private readonly Dictionary<byte[], CommandSpec> _specs;
 
-    private delegate void CommandHandler(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects);
+    private delegate void CommandHandler(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs);
 
     private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler, bool DenyOom = false, bool Write = false);
 
@@ -57,7 +57,8 @@ public sealed partial class CommandProcessor
     public CommandProcessor(RedisStore store, RedisStats stats, TimeProvider clock,
         PersistenceManager persistence, PubSubHub hub, int port, string? requirePass = null, int tlsPort = 0,
         long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction,
-        ReplicationManager? replication = null)
+        ReplicationManager? replication = null, int lfuLogFactor = 10, int lfuDecayTimeMinutes = 1,
+        bool clusterEnabled = false, IReadOnlyList<ClusterNodeRange>? clusterSlots = null)
     {
         _store = store;
         _stats = stats;
@@ -67,12 +68,25 @@ public sealed partial class CommandProcessor
         _replication = replication ?? new ReplicationManager(ReplicationManager.DefaultBacklogSizeBytes);
         _port = port;
         _tlsPort = tlsPort;
-        _requirePass = requirePass is null ? null : Encoding.UTF8.GetBytes(requirePass);
+        _acl = new AclManager(requirePass);
         _maxMemory = maxMemory;
         _maxMemoryPolicy = maxMemoryPolicy;
+        _store.LfuLogFactor = lfuLogFactor;
+        _store.LfuDecayTimeMinutes = lfuDecayTimeMinutes;
+        _clusterEnabled = clusterEnabled;
+        _clusterMap = clusterSlots ?? Array.Empty<ClusterNodeRange>();
+        _clusterNodeId = Convert.ToHexString(
+            System.Security.Cryptography.RandomNumberGenerator.GetBytes(20)).ToLowerInvariant();
         _startedAt = clock.GetUtcNow();
         _specs = BuildSpecs();
     }
+
+    private readonly bool _clusterEnabled;
+    private readonly IReadOnlyList<ClusterNodeRange> _clusterMap;
+    private readonly string _clusterNodeId;
+
+    /// <summary>Whether cluster mode is on (SELECT/MOVE/SWAPDB refuse, keys are slot-checked).</summary>
+    public bool ClusterEnabled => _clusterEnabled;
 
     /// <summary>The replication state machine this processor serves and enforces.</summary>
     public ReplicationManager Replication => _replication;
@@ -90,6 +104,11 @@ public sealed partial class CommandProcessor
         Add("PING", 1, 2, Ping, pubsub: true);
         Add("ECHO", 2, 2, Echo);
         Add("AUTH", 2, 3, Auth);
+        Add("ACL", 2, -1, Acl);
+        Add("EVAL", 3, -1, Eval, write: true);
+        Add("EVALSHA", 3, -1, EvalSha, write: true);
+        Add("SCRIPT", 2, -1, ScriptCommand);
+        Add("CLUSTER", 2, -1, ClusterCommand);
         Add("HELLO", 1, -1, Hello);
         Add("CLIENT", 2, -1, Client);
         Add("QUIT", 1, 1, Quit, pubsub: true);
@@ -97,6 +116,9 @@ public sealed partial class CommandProcessor
         Add("INFO", 1, 2, Info);
         Add("FLUSHDB", 1, 2, FlushDb, write: true);
         Add("FLUSHALL", 1, 2, FlushDb, write: true);
+        Add("SELECT", 2, 2, SelectDb);
+        Add("MOVE", 3, 3, Move, write: true);
+        Add("SWAPDB", 3, 3, SwapDb, write: true);
         Add("SAVE", 1, 1, Save);
         Add("BGSAVE", 1, 1, BgSave);
         Add("BGREWRITEAOF", 1, 1, BgRewriteAof);
@@ -177,7 +199,7 @@ public sealed partial class CommandProcessor
         return specs;
     }
 
-    private static void NoDispatch(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+    private static void NoDispatch(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
         throw new InvalidOperationException("Transaction commands are handled by ExecuteLocked.");
 
     // ------------------------------------------------------------------
@@ -201,20 +223,76 @@ public sealed partial class CommandProcessor
         lock (_gate)
         {
             var effects = new List<byte[][]>();
+            var effectDbs = new List<int>();
             foreach (var args in commands)
             {
-                ExecuteLocked(args, ctx, output, effects, inTransactionBody: false);
+                ExecuteLocked(args, ctx, output, effects, effectDbs, inTransactionBody: false);
                 if (effects.Count > 0)
                 {
-                    _persistence.AppendEffects(effects);
-                    RecordLocalEffects(effects);
+                    var framed = FrameEffects(effects, effectDbs);
+                    _persistence.AppendEffects(framed);
+                    RecordLocalEffects(framed);
                     effects.Clear();
+                    effectDbs.Clear();
                 }
                 if (ctx.CloseRequested)
                     break;
             }
         }
     }
+
+    // The database the effect stream (AOF + replication — one shared
+    // byte history) is currently framed in. Effects produced while a
+    // connection sits in another database are preceded by a SELECT
+    // frame, so replaying the stream from its start (database 0)
+    // reproduces every write in its own database. A value of -1 means
+    // "unknown" (forced by a full sync: the next effect is framed with
+    // an explicit SELECT whoever consumes the stream).
+    private int _streamDb;
+
+    private static readonly byte[][][] SelectFrames = CreateSelectFrames();
+
+    private static byte[][][] CreateSelectFrames()
+    {
+        var frames = new byte[RedisStore.DatabaseCount][][];
+        for (var db = 0; db < frames.Length; db++)
+            frames[db] = new[] { Ascii("SELECT"), Ascii(db.ToString(CultureInfo.InvariantCulture)) };
+        return frames;
+    }
+
+    /// <summary>
+    /// Frames raw effects for the stream: a SELECT frame precedes the
+    /// first effect of each database run. Streams of database-0-only
+    /// workloads are byte-identical to a server without logical
+    /// databases, which is what keeps pre-multi-DB AOFs meaningful.
+    /// </summary>
+    private List<byte[][]> FrameEffects(List<byte[][]> effects, List<int> effectDbs)
+    {
+        var framed = new List<byte[][]>(effects.Count + 2);
+        for (var i = 0; i < effects.Count; i++)
+        {
+            var db = effectDbs[i];
+            if (db != _streamDb)
+            {
+                framed.Add(SelectFrames[db]);
+                _streamDb = db;
+            }
+            framed.Add(effects[i]);
+        }
+        return framed;
+    }
+
+    /// <summary>
+    /// Forgets the stream's current database (a full sync just shipped
+    /// a snapshot whose consumer starts from an unknown database): the
+    /// next effect is preceded by an explicit SELECT frame.
+    /// </summary>
+    private void InvalidateStreamDb() => _streamDb = -1;
+
+    // The AOF replay context lives for the whole load (not one per
+    // command): a SELECT frame in the stream moves it, and the frames
+    // after it belong to that database.
+    private readonly ClientContext _replayContext = new() { IsAuthenticated = true, IsServerInternal = true };
 
     /// <summary>
     /// Executes one command during AOF replay: no client, no reply stream,
@@ -224,12 +302,11 @@ public sealed partial class CommandProcessor
     /// </summary>
     public bool ExecuteReplay(byte[][] args)
     {
-        var ctx = new ClientContext { IsAuthenticated = true, IsServerInternal = true };
         var sink = new ArrayBufferWriter<byte>();
         lock (_gate)
         {
             var before = sink.WrittenCount;
-            ExecuteLocked(args, ctx, sink, new List<byte[][]>(), inTransactionBody: false);
+            ExecuteLocked(args, _replayContext, sink, new List<byte[][]>(), new List<int>(), inTransactionBody: false);
             return !(sink.WrittenCount > before && sink.WrittenSpan[0] == (byte)'-');
         }
     }
@@ -258,15 +335,26 @@ public sealed partial class CommandProcessor
     /// </summary>
     public bool ApplyReplicationFrame(byte[][] args, byte[] rawFrame)
     {
-        var ctx = new ClientContext { IsAuthenticated = true, IsServerInternal = true };
+        // The apply context starts in the database the follow position
+        // has reached (the replication manager tracks it across frames
+        // and reconnects): the stream's SELECT frames are the only
+        // transitions, and this context follows them exactly as the
+        // primary's stream framed them.
+        var ctx = new ClientContext
+        {
+            IsAuthenticated = true,
+            IsServerInternal = true,
+            SelectedDb = _replication.FollowDb
+        };
         var sink = new ArrayBufferWriter<byte>();
         lock (_gate)
         {
             var before = sink.WrittenCount;
-            ExecuteLocked(args, ctx, sink, new List<byte[][]>(), inTransactionBody: false);
+            ExecuteLocked(args, ctx, sink, new List<byte[][]>(), new List<int>(), inTransactionBody: false);
             var errored = sink.WrittenCount > before && sink.WrittenSpan[0] == (byte)'-';
             if (errored)
                 return false;
+            _replication.FollowDb = ctx.SelectedDb;
             _persistence.AppendEffects(new[] { args });
             _replication.NoteAppliedFrame(rawFrame);
             return true;
@@ -297,7 +385,7 @@ public sealed partial class CommandProcessor
     }
 
     private void ExecuteLocked(byte[][] args, ClientContext ctx, IBufferWriter<byte> output,
-        List<byte[][]> effects, bool inTransactionBody)
+        List<byte[][]> effects, List<int> effectDbs, bool inTransactionBody)
     {
         _stats.AddCommand();
         if (args.Length == 0)
@@ -315,14 +403,26 @@ public sealed partial class CommandProcessor
 
         var rawName = args[0];
 
-        // Authentication gate: with a password configured, an
-        // unauthenticated connection may only AUTH, HELLO or QUIT — every
-        // other command (including MULTI/EXEC and unknown commands) is
-        // answered NOAUTH, exactly as Redis orders it. HELLO is exempt
-        // because it carries its own authentication clause and its own,
-        // longer NOAUTH text (see the Hello handler). Transaction bodies
-        // are not re-checked: the EXEC that carries them passed the gate.
-        if (!inTransactionBody && _requirePass is not null && !ctx.IsAuthenticated &&
+        // First contact for a client context: it acts as the default
+        // user, and starts authenticated exactly when that user is
+        // enabled and passwordless (no --requirepass, no password set
+        // with ACL SETUSER). Server-internal contexts (AOF replay,
+        // replication apply) carry their own identity and skip ACL
+        // entirely — they are not clients.
+        if (ctx.User is null && !ctx.IsServerInternal)
+        {
+            ctx.User = _acl.DefaultUser;
+            ctx.IsAuthenticated = _acl.DefaultUser.Enabled && _acl.DefaultUser.NoPass;
+        }
+
+        // Authentication gate: an unauthenticated connection may only
+        // AUTH, HELLO or QUIT — every other command (including MULTI/EXEC
+        // and unknown commands) is answered NOAUTH, exactly as Redis
+        // orders it. HELLO is exempt because it carries its own
+        // authentication clause and its own, longer NOAUTH text (see the
+        // Hello handler). Transaction bodies are not re-checked: the EXEC
+        // that carries them passed the gate.
+        if (!inTransactionBody && !ctx.IsServerInternal && !ctx.IsAuthenticated &&
             !IsName(rawName, "AUTH") && !IsName(rawName, "QUIT") && !IsName(rawName, "HELLO"))
         {
             RespWriter.WriteError(output, "NOAUTH Authentication required.");
@@ -334,6 +434,8 @@ public sealed partial class CommandProcessor
         {
             if (IsName(rawName, "MULTI"))
             {
+                if (!CheckCommandPermission("multi", ctx, output))
+                    return;
                 if (ctx.InTransaction)
                 {
                     RespWriter.WriteError(output, "ERR MULTI calls can not be nested");
@@ -347,11 +449,15 @@ public sealed partial class CommandProcessor
             }
             if (IsName(rawName, "EXEC"))
             {
-                ExecuteTransaction(ctx, output, effects);
+                if (!CheckCommandPermission("exec", ctx, output))
+                    return;
+                ExecuteTransaction(ctx, output, effects, effectDbs);
                 return;
             }
             if (IsName(rawName, "DISCARD"))
             {
+                if (!CheckCommandPermission("discard", ctx, output))
+                    return;
                 if (!ctx.InTransaction)
                 {
                     RespWriter.WriteError(output, "ERR DISCARD without MULTI");
@@ -389,6 +495,86 @@ public sealed partial class CommandProcessor
             return;
         }
 
+        // ACL enforcement, at the same point Redis checks it: after the
+        // command exists and its arity is known, before it runs. The
+        // command check comes first, then the keys it touches (extracted
+        // from the command's key specification) against the user's key
+        // patterns. Server-internal execution is not a client and is
+        // never refused. Commands queued in a MULTI reach this point when
+        // EXEC dispatches them, so their NOPERM errors land inside the
+        // EXEC array, as in Redis.
+        string? dispatchCanonical = null;
+        IReadOnlyList<byte[]> dispatchKeys = Array.Empty<byte[]>();
+        if (!ctx.IsServerInternal && ctx.User is { } aclUser)
+        {
+            var canonical = AclCatalog.CanonicalName(args);
+            dispatchCanonical = canonical;
+            // An unknown subcommand of a known container (CLIENT BOGUS)
+            // has no canonical name to check: the handler itself reports
+            // it as an unknown subcommand, as in Redis.
+            var checkable = !canonical.Contains('|') ||
+                            AclCatalog.AllCommandNames.Contains(canonical);
+            if (checkable && !aclUser.AllowsCommand(canonical))
+            {
+                RespWriter.WriteError(output,
+                    $"NOPERM this user has no permissions to run the '{canonical}' command");
+                return;
+            }
+            var keys = checkable ? AclCatalog.ExtractKeys(canonical, args) : Array.Empty<byte[]>();
+            dispatchKeys = keys;
+            if (keys.Count > 0 && !aclUser.AllowsKeys(keys, spec.Write))
+            {
+                RespWriter.WriteError(output,
+                    "NOPERM this user has no permissions to access one of the keys used as arguments");
+                return;
+            }
+        }
+
+        // Cluster slot gate (--cluster-enabled): after ACL, before
+        // anything runs. All of a command's keys must hash to one slot
+        // this node owns — a foreign slot is answered MOVED with the
+        // owner's address from the static map, several slots CROSSSLOT,
+        // and a slot no node serves CLUSTERDOWN. Keyless commands pass.
+        // Server-internal execution (AOF replay, replication apply) is
+        // not routed: its effects already carry the right database.
+        if (_clusterEnabled && !ctx.IsServerInternal &&
+            dispatchCanonical is not ("move" or "swapdb"))
+        {
+            // MOVE and SWAPDB are exempt from routing: cluster mode
+            // refuses them outright in their handlers, whatever slot
+            // their arguments would hash to.
+            var keys = dispatchKeys;
+            if (keys.Count == 0 && dispatchCanonical is { } clusterCanonical)
+                keys = AclCatalog.ExtractKeys(clusterCanonical, args);
+            if (keys.Count > 0)
+            {
+                var slot = ClusterSlot.OfKey(keys[0]);
+                var crossSlot = false;
+                for (var i = 1; i < keys.Count; i++)
+                    if (ClusterSlot.OfKey(keys[i]) != slot)
+                    {
+                        crossSlot = true;
+                        break;
+                    }
+                if (crossSlot)
+                {
+                    RespWriter.WriteError(output, "CROSSSLOT Keys in request don't hash to the same slot");
+                    return;
+                }
+                var owner = FindSlotOwner(slot);
+                if (owner is null)
+                {
+                    RespWriter.WriteError(output, "CLUSTERDOWN Hash slot not served");
+                    return;
+                }
+                if (owner.Port != _port)
+                {
+                    RespWriter.WriteError(output, $"MOVED {slot} {owner.Host}:{owner.Port}");
+                    return;
+                }
+            }
+        }
+
         // Read-only replica enforcement, at the point of actual dispatch
         // (so commands queued in a MULTI are judged when EXEC runs them,
         // and their READONLY errors land inside the EXEC array, as in
@@ -419,7 +605,8 @@ public sealed partial class CommandProcessor
                 while (_store.UsedMemory > _maxMemory && guard++ < 100_000 &&
                        _store.TryEvictOne(_maxMemoryPolicy) is { } victim)
                 {
-                    effects.Add(new[] { Ascii("DEL"), victim });
+                    effects.Add(new[] { Ascii("DEL"), victim.Key });
+                    effectDbs.Add(victim.Db);
                 }
             }
             if (spec.DenyOom && _store.UsedMemory > _maxMemory)
@@ -429,9 +616,14 @@ public sealed partial class CommandProcessor
             }
         }
 
+        // The handler's effects belong to the database the connection
+        // is in when the handler runs (a handler never changes it —
+        // SELECT records no effects), so the whole segment is stamped
+        // with it for the stream framing in ExecuteBatch.
+        var effectDb = ctx.Db;
         try
         {
-            spec.Handler(args, ctx, output, effects);
+            spec.Handler(args, ctx, output, effects, effectDbs);
         }
         catch (WrongTypeException ex)
         {
@@ -445,6 +637,22 @@ public sealed partial class CommandProcessor
         {
             RespWriter.WriteError(output, ex.Message);
         }
+        while (effectDbs.Count < effects.Count)
+            effectDbs.Add(effectDb);
+    }
+
+    /// <summary>
+    /// The ACL command-permission half of the check, for the commands
+    /// intercepted before normal dispatch (MULTI / EXEC / DISCARD).
+    /// Writes the NOPERM error and returns false when refused.
+    /// </summary>
+    private bool CheckCommandPermission(string canonical, ClientContext ctx, IBufferWriter<byte> output)
+    {
+        if (ctx.IsServerInternal || ctx.User is not { } user || user.AllowsCommand(canonical))
+            return true;
+        RespWriter.WriteError(output,
+            $"NOPERM this user has no permissions to run the '{canonical}' command");
+        return false;
     }
 
     private void QueueCommand(byte[][] args, ClientContext ctx, IBufferWriter<byte> output)
@@ -472,7 +680,7 @@ public sealed partial class CommandProcessor
         RespWriter.WriteSimpleString(output, "QUEUED");
     }
 
-    private void ExecuteTransaction(ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ExecuteTransaction(ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (!ctx.InTransaction)
         {
@@ -494,7 +702,7 @@ public sealed partial class CommandProcessor
         foreach (var queuedArgs in queued)
         {
             var reply = new ArrayBufferWriter<byte>();
-            ExecuteLocked(queuedArgs, ctx, reply, effects, inTransactionBody: true);
+            ExecuteLocked(queuedArgs, ctx, reply, effects, effectDbs, inTransactionBody: true);
             output.Write(reply.WrittenSpan);
         }
     }
@@ -601,7 +809,7 @@ public sealed partial class CommandProcessor
     /// covers SETINFO there; the SETINFO-attribute error is the 7.2
     /// form).
     /// </summary>
-    private void Client(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Client(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         switch (NameOf(args[1]))
         {
@@ -656,7 +864,7 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void Ping(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Ping(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (ctx.IsSubscribed)
         {
@@ -682,38 +890,52 @@ public sealed partial class CommandProcessor
             RespWriter.WriteSimpleString(output, "PONG");
     }
 
-    private void Echo(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+    private void Echo(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
         RespWriter.WriteBulkString(output, args[1]);
 
-    private void Auth(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private const string WrongPassText =
+        "WRONGPASS invalid username-password pair or user is disabled.";
+
+    private void Auth(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        byte[] presented;
         if (args.Length == 3)
         {
-            // AUTH <username> <password>: only the default user exists;
-            // any other name is indistinguishable from a bad password.
-            if (!args[1].AsSpan().SequenceEqual("default"u8))
-                throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
-            presented = args[2];
+            // AUTH <username> <password>: an unknown name, a disabled
+            // user and a bad password are indistinguishable, as in Redis.
+            // A failed attempt never revokes an already authenticated
+            // connection.
+            if (!TryAuthenticate(Encoding.UTF8.GetString(args[1]), args[2], ctx))
+                throw new RedisCommandException(WrongPassText);
         }
         else
         {
-            if (_requirePass is null)
+            // AUTH <password> authenticates as the default user; with no
+            // password configured for it there is nothing to match against.
+            var defaultUser = _acl.DefaultUser;
+            if (defaultUser.PasswordHashes.Count == 0)
                 throw new RedisCommandException(
                     "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?");
-            presented = args[1];
+            if (!defaultUser.Enabled || !defaultUser.CheckPassword(args[1]))
+                throw new RedisCommandException(WrongPassText);
+            ctx.User = defaultUser;
+            ctx.IsAuthenticated = true;
         }
-
-        // With no password configured the default user is passwordless, so
-        // the username form above authenticates unconditionally (as in
-        // Redis, whose default user carries no password then). A failed
-        // attempt never revokes an already authenticated connection.
-        if (_requirePass is not null &&
-            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(presented, _requirePass))
-            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
-
-        ctx.IsAuthenticated = true;
         RespWriter.WriteSimpleString(output, "OK");
+    }
+
+    /// <summary>
+    /// Authenticates the connection as the named user. Shared by AUTH and
+    /// by HELLO's AUTH clause. A passwordless (nopass) user accepts any
+    /// password; a user with passwords accepts any of them.
+    /// </summary>
+    private bool TryAuthenticate(string username, byte[] password, ClientContext ctx)
+    {
+        var user = _acl.Find(username);
+        if (user is null || !user.Enabled || !user.CheckPassword(password))
+            return false;
+        ctx.User = user;
+        ctx.IsAuthenticated = true;
+        return true;
     }
 
     /// <summary>
@@ -745,7 +967,7 @@ public sealed partial class CommandProcessor
     /// configured and the connection is still unauthenticated — HELLO's
     /// own NOAUTH text.
     /// </summary>
-    private void Hello(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Hello(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var proto = ctx.ProtocolVersion;
         var i = 1;
@@ -782,7 +1004,7 @@ public sealed partial class CommandProcessor
             }
         }
 
-        if (_requirePass is not null && !ctx.IsAuthenticated)
+        if (!ctx.IsAuthenticated)
             throw new RedisCommandException(
                 "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time");
 
@@ -810,41 +1032,92 @@ public sealed partial class CommandProcessor
     }
 
     /// <summary>
-    /// The AUTH clause of HELLO: unlike the AUTH command, presenting any
-    /// password succeeds when none is configured (the default user is
-    /// passwordless then); a wrong one fails with WRONGPASS and leaves
-    /// both the protocol version and the authentication state untouched.
+    /// The AUTH clause of HELLO: the named user must exist, be enabled
+    /// and match the password (a passwordless default user matches any
+    /// password, as in Redis); a failure is WRONGPASS and leaves both the
+    /// protocol version and the authentication state untouched.
     /// </summary>
     private void AuthenticateHello(byte[] user, byte[] password, ClientContext ctx)
     {
-        if (!user.AsSpan().SequenceEqual("default"u8))
-            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
-        if (_requirePass is not null &&
-            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(password, _requirePass))
-            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
-        ctx.IsAuthenticated = true;
+        if (!TryAuthenticate(Encoding.UTF8.GetString(user), password, ctx))
+            throw new RedisCommandException(WrongPassText);
     }
 
-    private void Quit(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Quit(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         RespWriter.WriteSimpleString(output, "OK");
         ctx.CloseRequested = true;
     }
 
-    private void DbSize(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.Count);
+    private void DbSize(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.CountInDb(ctx.Db));
+
+    private void SelectDb(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
+    {
+        if (_clusterEnabled)
+            throw new RedisCommandException("ERR SELECT is not allowed in cluster mode");
+        ctx.SelectedDb = ParseDbIndex(args[1]);
+        RespWriter.WriteSimpleString(output, "OK");
+    }
+
+    /// <summary>
+    /// Parses and range-checks a logical-database index, with Redis's
+    /// two distinct errors (both probed): not a number at all, and a
+    /// number outside the 0..15 range.
+    /// </summary>
+    internal static int ParseDbIndex(byte[] arg)
+    {
+        if (!long.TryParse(RespParser.Describe(arg), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var index))
+            throw new RedisCommandException("ERR value is not an integer or out of range");
+        if (index < 0 || index >= RedisStore.DatabaseCount)
+            throw new RedisCommandException("ERR DB index is out of range");
+        return (int)index;
+    }
+
+    private void Move(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
+    {
+        if (_clusterEnabled)
+            throw new RedisCommandException("ERR MOVE is not allowed in cluster mode");
+        var target = ParseDbIndex(args[2]);
+        if (target == ctx.Db)
+            throw new RedisCommandException("ERR source and destination objects are the same");
+        if (!_store.MoveEntry(args[1], ctx.Db, target))
+        {
+            RespWriter.WriteInteger(output, 0);
+            return;
+        }
+        effects.Add(args);
+        RespWriter.WriteInteger(output, 1);
+    }
+
+    private void SwapDb(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
+    {
+        if (_clusterEnabled)
+            throw new RedisCommandException("ERR SWAPDB is not allowed in cluster mode");
+        var first = ParseDbIndex(args[1]);
+        var second = ParseDbIndex(args[2]);
+        if (first != second)
+        {
+            _store.SwapDbs(first, second);
+            effects.Add(args);
+        }
+        RespWriter.WriteSimpleString(output, "OK");
+    }
 
     internal static string PolicyName(MaxMemoryPolicy policy) => policy switch
     {
         MaxMemoryPolicy.AllKeysLru => "allkeys-lru",
         MaxMemoryPolicy.AllKeysRandom => "allkeys-random",
+        MaxMemoryPolicy.AllKeysLfu => "allkeys-lfu",
         MaxMemoryPolicy.VolatileLru => "volatile-lru",
         MaxMemoryPolicy.VolatileRandom => "volatile-random",
         MaxMemoryPolicy.VolatileTtl => "volatile-ttl",
+        MaxMemoryPolicy.VolatileLfu => "volatile-lfu",
         _ => "noeviction"
     };
 
-    private void Info(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Info(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var section = args.Length == 2 ? NameOf(args[1]) : null;
         var builder = new StringBuilder();
@@ -897,6 +1170,8 @@ public sealed partial class CommandProcessor
             builder.Append("pubsub_channels:").Append(_hub.ChannelCount).Append("\r\n");
             builder.Append("pubsub_patterns:").Append(_hub.PatternCount).Append("\r\n");
         });
+        if (_clusterEnabled)
+            Section("Cluster", () => builder.Append("cluster_enabled:1\r\n"));
         Section("Replication", () =>
         {
             if (_replication.IsReplica)
@@ -923,9 +1198,15 @@ public sealed partial class CommandProcessor
         });
         Section("Keyspace", () =>
         {
-            builder.Append("db0:keys=").Append(_store.Count)
-                .Append(",expires=").Append(_store.ExpiresCount)
-                .Append(",avg_ttl=0\r\n");
+            for (var db = 0; db < RedisStore.DatabaseCount; db++)
+            {
+                var keys = _store.CountInDb(db);
+                if (keys == 0)
+                    continue;
+                builder.Append("db").Append(db).Append(":keys=").Append(keys)
+                    .Append(",expires=").Append(_store.ExpiresInDb(db))
+                    .Append(",avg_ttl=0\r\n");
+            }
         });
 
         var text = builder.ToString();
@@ -946,7 +1227,7 @@ public sealed partial class CommandProcessor
         RespWriter.WriteBulkString(output, text);
     }
 
-    private void FlushDb(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void FlushDb(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (args.Length == 2)
         {
@@ -954,12 +1235,23 @@ public sealed partial class CommandProcessor
             if (mode is not ("ASYNC" or "SYNC"))
                 throw SyntaxError();
         }
-        _store.FlushAll();
-        effects.Add(new[] { Ascii("FLUSHALL") });
+        if (IsName(args[0], "FLUSHALL"))
+        {
+            _store.FlushAll();
+            effects.Add(new[] { Ascii("FLUSHALL") });
+        }
+        else
+        {
+            // FLUSHDB empties only the connection's selected database;
+            // the effect is the bare command, framed into that database
+            // by the stream framing like any other effect.
+            _store.FlushDb(ctx.Db);
+            effects.Add(new[] { Ascii("FLUSHDB") });
+        }
         RespWriter.WriteSimpleString(output, "OK");
     }
 
-    private void Save(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Save(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         try
         {
@@ -972,7 +1264,7 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void BgSave(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void BgSave(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (Interlocked.CompareExchange(ref _backgroundSaveRunning, 1, 0) != 0)
         {
@@ -998,7 +1290,7 @@ public sealed partial class CommandProcessor
         RespWriter.WriteSimpleString(output, "Background saving started");
     }
 
-    private void BgRewriteAof(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void BgRewriteAof(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (!_persistence.AofEnabled)
         {
@@ -1021,7 +1313,7 @@ public sealed partial class CommandProcessor
     /// acknowledgements). Accepted and otherwise ignored — progress here
     /// is tracked by stream position, not by replica acknowledgements.
     /// </summary>
-    private void ReplConf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+    private void ReplConf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
         RespWriter.WriteSimpleString(output, "OK");
 
     /// <summary>
@@ -1031,7 +1323,7 @@ public sealed partial class CommandProcessor
     /// reconnects, or stops by itself. The dataset is left untouched by
     /// the switch: an incoming full sync replaces it wholesale.
     /// </summary>
-    private void ReplicaOf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ReplicaOf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (IsName(args[1], "NO") && IsName(args[2], "ONE"))
         {
@@ -1064,7 +1356,7 @@ public sealed partial class CommandProcessor
     /// +FULLRESYNC line, then a bulk-string header and the raw snapshot
     /// bytes with NO trailing CRLF.
     /// </summary>
-    private void PSync(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void PSync(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (ctx.PostFrame is null)
         {
@@ -1082,6 +1374,9 @@ public sealed partial class CommandProcessor
         if (kind == SyncKind.Full)
         {
             var snapshot = SnapshotFile.Serialize(_store.ExportState());
+            // The snapshot's consumer starts from an unknown stream
+            // database: frame the next effect with an explicit SELECT.
+            InvalidateStreamDb();
             var head = Encoding.ASCII.GetBytes(
                 $"+FULLRESYNC {_replication.ReplId} {_replication.Offset}\r\n${snapshot.Length}\r\n");
             header = new byte[head.Length + snapshot.Length];
@@ -1114,7 +1409,7 @@ public sealed partial class CommandProcessor
     // String commands
     // ------------------------------------------------------------------
 
-    private void Set(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Set(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var key = args[1];
         var value = args[2];
@@ -1162,9 +1457,9 @@ public sealed partial class CommandProcessor
 
         byte[]? oldValue = null;
         if (returnOld)
-            oldValue = _store.Get(key); // throws WRONGTYPE for non-strings, like Redis
+            oldValue = _store.Get(key, ctx.Db); // throws WRONGTYPE for non-strings, like Redis
 
-        var outcome = _store.Set(key, value, condition, ttl, keepTtl);
+        var outcome = _store.Set(key, value, condition, ttl, keepTtl, ctx.Db);
         if (outcome == SetOutcome.Stored)
         {
             var effect = new List<byte[]> { Ascii("SET"), key, value };
@@ -1186,9 +1481,9 @@ public sealed partial class CommandProcessor
             RespWriter.WriteNull(output, ctx.ProtocolVersion);
     }
 
-    private void Get(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Get(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var value = _store.Get(args[1]);
+        var value = _store.Get(args[1], ctx.Db);
         if (value is null)
             _stats.AddKeyspaceMiss();
         else
@@ -1196,83 +1491,83 @@ public sealed partial class CommandProcessor
         RespWriter.WriteBulkStringOrNull(output, value, ctx.ProtocolVersion);
     }
 
-    private void Del(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Del(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var removed = _store.Delete(Tail(args, 1));
+        var removed = _store.Delete(Tail(args, 1), ctx.Db);
         if (removed > 0)
             effects.Add(args);
         RespWriter.WriteInteger(output, removed);
     }
 
-    private void Exists(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.Exists(Tail(args, 1)));
+    private void Exists(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.Exists(Tail(args, 1), ctx.Db));
 
-    private void Incr(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        Delta(args, 1, output, effects);
+    private void Incr(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        Delta(args, 1, output, effects, ctx.Db);
 
-    private void Decr(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        Delta(args, -1, output, effects);
+    private void Decr(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        Delta(args, -1, output, effects, ctx.Db);
 
-    private void IncrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        Delta(args, ParseLong(args[2]), output, effects);
+    private void IncrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        Delta(args, ParseLong(args[2]), output, effects, ctx.Db);
 
-    private void DecrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void DecrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var amount = ParseLong(args[2]);
         if (amount == long.MinValue)
             throw new ValueErrorException("ERR decrement would overflow");
-        Delta(args, -amount, output, effects);
+        Delta(args, -amount, output, effects, ctx.Db);
     }
 
-    private void Delta(byte[][] args, long delta, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Delta(byte[][] args, long delta, IBufferWriter<byte> output, List<byte[][]> effects, int db)
     {
-        var next = _store.ApplyDelta(args[1], delta);
+        var next = _store.ApplyDelta(args[1], delta, db);
         effects.Add(args);
         RespWriter.WriteInteger(output, next);
     }
 
-    private void Append(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Append(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var length = _store.Append(args[1], args[2]);
+        var length = _store.Append(args[1], args[2], ctx.Db);
         effects.Add(args);
         RespWriter.WriteInteger(output, length);
     }
 
-    private void StrLen(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.StrLen(args[1]));
+    private void StrLen(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.StrLen(args[1], ctx.Db));
 
     // ------------------------------------------------------------------
     // Key commands
     // ------------------------------------------------------------------
 
-    private void Expire(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        ExpireCore(args, milliseconds: false, output, effects);
+    private void Expire(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        ExpireCore(args, milliseconds: false, output, effects, ctx.Db);
 
-    private void PExpire(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        ExpireCore(args, milliseconds: true, output, effects);
+    private void PExpire(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        ExpireCore(args, milliseconds: true, output, effects, ctx.Db);
 
-    private void ExpireCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ExpireCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects, int db)
     {
         var amount = ParseLong(args[2]);
         var candidate = milliseconds
             ? _clock.GetUtcNow() + TimeSpan.FromMilliseconds(amount)
             : _clock.GetUtcNow() + TimeSpan.FromSeconds(amount);
-        ConditionalDeadline(args, candidate, output, effects);
+        ConditionalDeadline(args, candidate, output, effects, db);
     }
 
-    private void ExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        ExpireAtCore(args, milliseconds: false, output, effects);
+    private void ExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        ExpireAtCore(args, milliseconds: false, output, effects, ctx.Db);
 
-    private void PExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        ExpireAtCore(args, milliseconds: true, output, effects);
+    private void PExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        ExpireAtCore(args, milliseconds: true, output, effects, ctx.Db);
 
-    private void ExpireAtCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ExpireAtCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects, int db)
     {
         var unix = ParseLong(args[2]);
         var candidate = milliseconds
             ? DateTimeOffset.FromUnixTimeMilliseconds(unix)
             : DateTimeOffset.FromUnixTimeSeconds(unix);
-        ConditionalDeadline(args, candidate, output, effects);
+        ConditionalDeadline(args, candidate, output, effects, db);
     }
 
     /// <summary>
@@ -1281,14 +1576,14 @@ public sealed partial class CommandProcessor
     /// then apply the candidate deadline (which may delete the key when
     /// it already lies in the past).
     /// </summary>
-    private void ConditionalDeadline(byte[][] args, DateTimeOffset candidate, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ConditionalDeadline(byte[][] args, DateTimeOffset candidate, IBufferWriter<byte> output, List<byte[][]> effects, int db)
     {
         var key = args[1];
         var condition = args.Length == 4 ? NameOf(args[3]) : null;
         if (condition is not (null or "NX" or "XX" or "GT" or "LT"))
             throw new RedisCommandException($"ERR Unsupported option {RespParser.Describe(args[3])}");
 
-        if (!_store.TryGetExpiry(key, out var current))
+        if (!_store.TryGetExpiry(key, out var current, db))
         {
             RespWriter.WriteInteger(output, 0);
             return;
@@ -1310,12 +1605,12 @@ public sealed partial class CommandProcessor
             return;
         }
 
-        ApplyDeadline(key, candidate, output, effects);
+        ApplyDeadline(key, candidate, output, effects, db);
     }
 
-    private void ApplyDeadline(byte[] key, DateTimeOffset candidate, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ApplyDeadline(byte[] key, DateTimeOffset candidate, IBufferWriter<byte> output, List<byte[][]> effects, int db)
     {
-        var applied = _store.ExpireAt(key, candidate, out var removedKey);
+        var applied = _store.ExpireAt(key, candidate, out var removedKey, db);
         if (applied)
         {
             effects.Add(removedKey
@@ -1325,27 +1620,27 @@ public sealed partial class CommandProcessor
         RespWriter.WriteInteger(output, applied ? 1 : 0);
     }
 
-    private void Ttl(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Ttl(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var ms = _store.TtlMilliseconds(args[1]);
+        var ms = _store.TtlMilliseconds(args[1], ctx.Db);
         // Redis reports whole seconds, rounded to the nearest second.
         RespWriter.WriteInteger(output, ms < 0 ? ms : (ms + 500) / 1000);
     }
 
-    private void PTtl(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.TtlMilliseconds(args[1]));
+    private void PTtl(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.TtlMilliseconds(args[1], ctx.Db));
 
-    private void Persist(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Persist(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var persisted = _store.Persist(args[1]);
+        var persisted = _store.Persist(args[1], ctx.Db);
         if (persisted)
             effects.Add(args);
         RespWriter.WriteInteger(output, persisted ? 1 : 0);
     }
 
-    private void TypeCommand(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void TypeCommand(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var name = _store.TypeOf(args[1]) switch
+        var name = _store.TypeOf(args[1], ctx.Db) switch
         {
             RedisType.String => "string",
             RedisType.List => "list",
@@ -1357,9 +1652,9 @@ public sealed partial class CommandProcessor
         RespWriter.WriteSimpleString(output, name);
     }
 
-    private void Keys(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Keys(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var keys = _store.Keys(args[1]);
+        var keys = _store.Keys(args[1], ctx.Db);
         RespWriter.WriteArrayHeader(output, keys.Count);
         foreach (var key in keys)
             RespWriter.WriteBulkString(output, key);

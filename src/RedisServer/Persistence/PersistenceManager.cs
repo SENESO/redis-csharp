@@ -78,8 +78,22 @@ public sealed class PersistenceManager : IDisposable
         if (_aof is null)
             throw new InvalidOperationException("AOF is not enabled.");
         var commands = new List<byte[][]>();
+        // ExportState walks databases in index order, so each database's
+        // entries are contiguous: a SELECT frame opens each non-zero
+        // group (database 0 needs none — replay starts there), exactly
+        // the framing the live effect stream uses.
+        var currentDb = 0;
         foreach (var entry in store.ExportState())
         {
+            if (entry.Db != currentDb)
+            {
+                commands.Add(new[]
+                {
+                    "SELECT"u8.ToArray(),
+                    Encoding.ASCII.GetBytes(entry.Db.ToString(CultureInfo.InvariantCulture))
+                });
+                currentDb = entry.Db;
+            }
             commands.AddRange(CommandsForEntry(entry));
             if (entry.ExpiresAt is { } expiry)
             {
@@ -183,18 +197,27 @@ public sealed class PersistenceManager : IDisposable
             return;
         }
 
-        var status = SnapshotFile.TryRead(SnapshotPath, out var entries, out var error);
+        // Streamed: entries are imported as they parse, in bounded
+        // memory however large the snapshot has grown. A CRC failure
+        // can only be known at the end of the stream, so a corrupt
+        // snapshot flushes whatever partial prefix it delivered —
+        // the net state is the same "corrupt ⇒ start empty" as ever.
+        long imported = 0;
+        var status = SnapshotFile.StreamRead(SnapshotPath, entry =>
+        {
+            store.ImportEntry(entry);
+            imported++;
+        }, out var error);
         switch (status)
         {
             case SnapshotLoadStatus.Loaded:
-                foreach (var entry in entries)
-                    store.ImportEntry(entry);
-                _logger.LogInformation("Loaded {Count} keys from the snapshot.", entries.Count);
+                _logger.LogInformation("Loaded {Count} keys from the snapshot.", imported);
                 break;
             case SnapshotLoadStatus.Missing:
                 _logger.LogInformation("No persisted state found; starting empty.");
                 break;
             case SnapshotLoadStatus.Corrupt:
+                store.FlushAll();
                 _logger.LogError("The snapshot file is corrupt ({Error}); starting empty.", error);
                 break;
         }

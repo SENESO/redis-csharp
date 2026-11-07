@@ -399,7 +399,9 @@ internal sealed class SessionHarness : IAsyncDisposable
 
     public static SessionHarness Start(bool appendOnly = false, string? requirePass = null,
         long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction,
-        long replBacklogSizeBytes = ReplicationManager.DefaultBacklogSizeBytes)
+        long replBacklogSizeBytes = ReplicationManager.DefaultBacklogSizeBytes,
+        int lfuLogFactor = 10, int lfuDecayTimeMinutes = 1,
+        bool clusterEnabled = false, string? clusterSlots = null, int clusterPort = 0)
     {
         var clock = new FakeTimeProvider();
         var stats = new RedisStats();
@@ -415,9 +417,11 @@ internal sealed class SessionHarness : IAsyncDisposable
         var persistence = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
         var hub = new PubSubHub();
         var replication = new ReplicationManager(replBacklogSizeBytes);
-        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0,
+        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: clusterPort,
             requirePass: requirePass, maxMemory: maxMemory, maxMemoryPolicy: maxMemoryPolicy,
-            replication: replication);
+            replication: replication, lfuLogFactor: lfuLogFactor, lfuDecayTimeMinutes: lfuDecayTimeMinutes,
+            clusterEnabled: clusterEnabled,
+            clusterSlots: clusterSlots is null ? null : ServerOptions.ParseClusterSlots(clusterSlots));
         return new SessionHarness(store, stats, clock, processor, hub, persistence, replication, directory);
     }
 

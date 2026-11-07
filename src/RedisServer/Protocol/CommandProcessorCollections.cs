@@ -28,7 +28,7 @@ public sealed partial class CommandProcessor
     private readonly Dictionary<long, ScanState> _scanStates = new();
     private long _nextScanId;
 
-    private void Scan(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Scan(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (!long.TryParse(RespParser.Describe(args[1]), NumberStyles.Integer, CultureInfo.InvariantCulture, out var cursorInput)
             || cursorInput < 0)
@@ -72,7 +72,7 @@ public sealed partial class CommandProcessor
         long stateId = 0;
         if (cursorInput == 0)
         {
-            keys = new List<byte[]>(match is null ? _store.AllKeysSorted() : _store.Keys(match));
+            keys = new List<byte[]>(match is null ? _store.AllKeysSorted(ctx.Db) : _store.Keys(match, ctx.Db));
             if (typeFilter is not null)
             {
                 var wanted = typeFilter switch
@@ -84,7 +84,7 @@ public sealed partial class CommandProcessor
                     "ZSET" => RedisType.ZSet,
                     _ => RedisType.None
                 };
-                keys = keys.Where(k => _store.TypeOf(k) == wanted).ToList();
+                keys = keys.Where(k => _store.TypeOf(k, ctx.Db) == wanted).ToList();
             }
             offset = 0;
         }
@@ -153,32 +153,32 @@ public sealed partial class CommandProcessor
     // Lists
     // ------------------------------------------------------------------
 
-    private void LeftPush(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void LeftPush(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var length = _store.LeftPush(args[1], Tail(args, 2));
+        var length = _store.LeftPush(args[1], Tail(args, 2), ctx.Db);
         effects.Add(args);
         RespWriter.WriteInteger(output, length);
     }
 
-    private void RightPush(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void RightPush(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var length = _store.RightPush(args[1], Tail(args, 2));
+        var length = _store.RightPush(args[1], Tail(args, 2), ctx.Db);
         effects.Add(args);
         RespWriter.WriteInteger(output, length);
     }
 
-    private void LeftPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        PopCore(args, left: true, ctx, output, effects);
+    private void LeftPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        PopCore(args, left: true, ctx, output, effects, effectDbs);
 
-    private void RightPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        PopCore(args, left: false, ctx, output, effects);
+    private void RightPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        PopCore(args, left: false, ctx, output, effects, effectDbs);
 
-    private void PopCore(byte[][] args, bool left, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void PopCore(byte[][] args, bool left, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var key = args[1];
         if (args.Length == 2)
         {
-            var value = left ? _store.LeftPop(key) : _store.RightPop(key);
+            var value = left ? _store.LeftPop(key, ctx.Db) : _store.RightPop(key, ctx.Db);
             if (value is not null)
                 effects.Add(args);
             RespWriter.WriteBulkStringOrNull(output, value, ctx.ProtocolVersion);
@@ -187,12 +187,12 @@ public sealed partial class CommandProcessor
 
         if (!RedisStore.TryParseStrictLong(args[2], out var count) || count < 0)
             throw new ValueErrorException("ERR value is out of range, must be positive");
-        if (_store.TypeOf(key) == RedisType.None)
+        if (_store.TypeOf(key, ctx.Db) == RedisType.None)
         {
             RespWriter.WriteNullArrayValue(output, ctx.ProtocolVersion);
             return;
         }
-        var values = left ? _store.LeftPop(key, count) : _store.RightPop(key, count);
+        var values = left ? _store.LeftPop(key, count, ctx.Db) : _store.RightPop(key, count, ctx.Db);
         if (values.Count > 0)
             effects.Add(args);
         RespWriter.WriteArrayHeader(output, values.Count);
@@ -200,43 +200,43 @@ public sealed partial class CommandProcessor
             RespWriter.WriteBulkString(output, value);
     }
 
-    private void ListLength(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.ListLength(args[1]));
+    private void ListLength(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.ListLength(args[1], ctx.Db));
 
-    private void ListRange(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ListRange(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var values = _store.ListRange(args[1], ParseLong(args[2]), ParseLong(args[3]));
+        var values = _store.ListRange(args[1], ParseLong(args[2]), ParseLong(args[3]), ctx.Db);
         RespWriter.WriteArrayHeader(output, values.Count);
         foreach (var value in values)
             RespWriter.WriteBulkString(output, value);
     }
 
-    private void ListIndex(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteBulkStringOrNull(output, _store.ListIndex(args[1], ParseLong(args[2])), ctx.ProtocolVersion);
+    private void ListIndex(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteBulkStringOrNull(output, _store.ListIndex(args[1], ParseLong(args[2]), ctx.Db), ctx.ProtocolVersion);
 
     // ------------------------------------------------------------------
     // Sets
     // ------------------------------------------------------------------
 
-    private void SetAdd(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void SetAdd(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var added = _store.SetAdd(args[1], Tail(args, 2));
+        var added = _store.SetAdd(args[1], Tail(args, 2), ctx.Db);
         if (added > 0)
             effects.Add(args);
         RespWriter.WriteInteger(output, added);
     }
 
-    private void SetRemove(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void SetRemove(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var removed = _store.SetRemove(args[1], Tail(args, 2));
+        var removed = _store.SetRemove(args[1], Tail(args, 2), ctx.Db);
         if (removed > 0)
             effects.Add(args);
         RespWriter.WriteInteger(output, removed);
     }
 
-    private void SetMembers(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void SetMembers(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var members = _store.SetMembers(args[1]);
+        var members = _store.SetMembers(args[1], ctx.Db);
         // A RESP3 set (~) instead of an array; RESP2 keeps the array.
         if (ctx.ProtocolVersion >= 3)
             RespWriter.WriteSetHeader(output, members.Count);
@@ -246,17 +246,17 @@ public sealed partial class CommandProcessor
             RespWriter.WriteBulkString(output, member);
     }
 
-    private void SetIsMember(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.SetIsMember(args[1], args[2]) ? 1 : 0);
+    private void SetIsMember(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.SetIsMember(args[1], args[2], ctx.Db) ? 1 : 0);
 
-    private void SetCard(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.SetCard(args[1]));
+    private void SetCard(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.SetCard(args[1], ctx.Db));
 
     // ------------------------------------------------------------------
     // Hashes
     // ------------------------------------------------------------------
 
-    private void HashSet(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void HashSet(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if ((args.Length - 2) % 2 != 0)
         {
@@ -266,25 +266,25 @@ public sealed partial class CommandProcessor
         var pairs = new List<KeyValuePair<byte[], byte[]>>();
         for (var i = 2; i < args.Length; i += 2)
             pairs.Add(new KeyValuePair<byte[], byte[]>(args[i], args[i + 1]));
-        var added = _store.HashSet(args[1], pairs);
+        var added = _store.HashSet(args[1], pairs, ctx.Db);
         effects.Add(args);
         RespWriter.WriteInteger(output, added);
     }
 
-    private void HashGet(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteBulkStringOrNull(output, _store.HashGet(args[1], args[2]), ctx.ProtocolVersion);
+    private void HashGet(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteBulkStringOrNull(output, _store.HashGet(args[1], args[2], ctx.Db), ctx.ProtocolVersion);
 
-    private void HashDelete(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void HashDelete(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var removed = _store.HashDelete(args[1], Tail(args, 2));
+        var removed = _store.HashDelete(args[1], Tail(args, 2), ctx.Db);
         if (removed > 0)
             effects.Add(args);
         RespWriter.WriteInteger(output, removed);
     }
 
-    private void HashGetAll(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void HashGetAll(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var pairs = _store.HashGetAll(args[1]);
+        var pairs = _store.HashGetAll(args[1], ctx.Db);
         // A RESP3 map (%) of field→value; RESP2 keeps the flat array.
         if (ctx.ProtocolVersion >= 3)
             RespWriter.WriteMapHeader(output, pairs.Count);
@@ -297,14 +297,14 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void HashLength(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.HashLength(args[1]));
+    private void HashLength(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.HashLength(args[1], ctx.Db));
 
     // ------------------------------------------------------------------
     // Sorted sets
     // ------------------------------------------------------------------
 
-    private void ZAdd(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ZAdd(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var nx = false;
         var xx = false;
@@ -355,7 +355,7 @@ public sealed partial class CommandProcessor
             items.Add((score, args[j + 1]));
         }
 
-        var result = _store.ZAdd(args[1], mode, countChanged, increment, items, requireExisting: xx);
+        var result = _store.ZAdd(args[1], mode, countChanged, increment, items, requireExisting: xx, db: ctx.Db);
         effects.Add(args);
         if (increment)
         {
@@ -374,12 +374,12 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void ZIncrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ZIncrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         if (!RedisStore.TryParseDouble(args[2], out var delta))
             throw ValueErrorException.NotAFloat();
         var result = _store.ZAdd(args[1], ZAddMode.None, false, increment: true,
-            new[] { (delta, args[3]) });
+            new[] { (delta, args[3]) }, db: ctx.Db);
         effects.Add(args);
         if (ctx.ProtocolVersion >= 3)
             RespWriter.WriteDoubleOrNull(output, result.IncrementScore, ctx.ProtocolVersion);
@@ -389,9 +389,9 @@ public sealed partial class CommandProcessor
             RespWriter.WriteNullBulkString(output);
     }
 
-    private void ZScore(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ZScore(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var score = _store.ZScore(args[1], args[2]);
+        var score = _store.ZScore(args[1], args[2], ctx.Db);
         if (ctx.ProtocolVersion >= 3)
         {
             RespWriter.WriteDoubleOrNull(output, score, ctx.ProtocolVersion);
@@ -403,7 +403,7 @@ public sealed partial class CommandProcessor
             RespWriter.WriteNullBulkString(output);
     }
 
-    private void ZRange(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ZRange(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var withScores = false;
         if (args.Length == 5)
@@ -412,7 +412,7 @@ public sealed partial class CommandProcessor
                 throw SyntaxError();
             withScores = true;
         }
-        var range = _store.ZRange(args[1], ParseLong(args[2]), ParseLong(args[3]));
+        var range = _store.ZRange(args[1], ParseLong(args[2]), ParseLong(args[3]), ctx.Db);
         if (withScores && ctx.ProtocolVersion >= 3)
         {
             // RESP3 nests each (member, score) pair in its own array,
@@ -436,40 +436,54 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void ZRemove(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void ZRemove(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
-        var removed = _store.ZRemove(args[1], Tail(args, 2));
+        var removed = _store.ZRemove(args[1], Tail(args, 2), ctx.Db);
         if (removed > 0)
             effects.Add(args);
         RespWriter.WriteInteger(output, removed);
     }
 
-    private void ZCard(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteInteger(output, _store.ZCard(args[1]));
+    private void ZCard(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs) =>
+        RespWriter.WriteInteger(output, _store.ZCard(args[1], ctx.Db));
 
     // ------------------------------------------------------------------
     // Pub/sub
     // ------------------------------------------------------------------
 
-    private void Subscribe(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Subscribe(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         foreach (var channel in Tail(args, 1))
         {
+            CheckChannelPermission(ctx, channel);
             _hub.Subscribe(ctx, channel);
             WriteSubscriptionReply(output, "subscribe", channel, ctx.SubscriptionCount, ctx);
         }
     }
 
-    private void SubscribePattern(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void SubscribePattern(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         foreach (var pattern in Tail(args, 1))
         {
+            CheckChannelPermission(ctx, pattern);
             _hub.SubscribePattern(ctx, pattern);
             WriteSubscriptionReply(output, "psubscribe", pattern, ctx.SubscriptionCount, ctx);
         }
     }
 
-    private void Unsubscribe(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    /// <summary>
+    /// ACL channel patterns: a user with channel rules may only
+    /// subscribe to matching channels. The message mirrors the key
+    /// pattern refusal.
+    /// </summary>
+    private static void CheckChannelPermission(ClientContext ctx, byte[] channel)
+    {
+        if (ctx.User is { } user && !user.AllowsChannel(channel))
+            throw new RedisCommandException(
+                "NOPERM this user has no permissions to access one of the channels used as arguments");
+    }
+
+    private void Unsubscribe(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var targets = args.Length > 1 ? Tail(args, 1) : ctx.Channels.ToList();
         if (targets.Count == 0)
@@ -484,7 +498,7 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void UnsubscribePattern(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void UnsubscribePattern(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var targets = args.Length > 1 ? Tail(args, 1) : ctx.Patterns.ToList();
         if (targets.Count == 0)
@@ -508,7 +522,7 @@ public sealed partial class CommandProcessor
         RespWriter.WriteInteger(output, count);
     }
 
-    private void Publish(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void Publish(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects, List<int> effectDbs)
     {
         var receivers = _hub.Publish(args[1], args[2]);
         _stats.AddPublishedMessage();

@@ -150,10 +150,15 @@ public sealed class ReplicationTests
         Assert.Contains(entries, e => Encoding.ASCII.GetString(e.Key) == "a");
         Assert.Contains(entries, e => Encoding.ASCII.GetString(e.Key) == "l");
 
-        // Writes after the sync propagate as frames, in order.
+        // Writes after the sync propagate as frames, in order. A full
+        // sync invalidates the stream's database framing, so the first
+        // live frame is an explicit SELECT (here database 0) — the
+        // replica's snapshot carried no stream position to infer it from.
         await writer.SendCommandAsync("SET", "b", "2");
         await writer.ExpectAsync("+OK\r\n");
         var frame = await link.ReadReplyAsync() as List<object?>;
+        Assert.Equal(new List<object?> { "SELECT", "0" }, frame);
+        frame = await link.ReadReplyAsync() as List<object?>;
         Assert.Equal(new List<object?> { "SET", "b", "2" }, frame);
     }
 
@@ -249,7 +254,12 @@ public sealed class ReplicationTests
         var aof = AppendOnlyFile.ReadCommands(
             Path.Combine(h.DataDirectory, "appendonly.aof"), out var truncated);
         Assert.False(truncated);
-        Assert.Equal(6, aof.Count); // SET, INCR, LPUSH, SET, PEXPIREAT, DEL
+        // The full sync above invalidated the stream's database framing,
+        // so both histories open with an explicit SELECT 0; then the six
+        // effects: SET, INCR, LPUSH, SET, PEXPIREAT, DEL.
+        Assert.Equal(7, aof.Count);
+        Assert.Equal("SELECT", Encoding.ASCII.GetString(aof[0][0]));
+        Assert.Equal("0", Encoding.ASCII.GetString(aof[0][1]));
 
         foreach (var expected in aof)
         {

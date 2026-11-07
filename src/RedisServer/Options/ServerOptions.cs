@@ -25,8 +25,10 @@ namespace RedisServer.Options;
 /// <item><c>--maxmemory &lt;bytes&gt;</c> — memory ceiling for the dataset (default 0: no limit). Accepts
 /// Redis's size suffixes: k = 1000, kb = 1024, m/mb, g/gb likewise</item>
 /// <item><c>--maxmemory-policy &lt;name&gt;</c> — eviction policy at the ceiling: noeviction (default),
-/// allkeys-lru, allkeys-random, volatile-lru, volatile-random, volatile-ttl (the LFU family is not
-/// implemented and is refused at startup)</item>
+/// allkeys-lru, allkeys-random, allkeys-lfu, volatile-lru, volatile-random, volatile-ttl,
+/// volatile-lfu</item>
+/// <item><c>--lfu-log-factor &lt;n&gt;</c> — LFU counter logarithmic factor (default 10)</item>
+/// <item><c>--lfu-decay-time &lt;minutes&gt;</c> — LFU counter decay period in minutes (default 1)</item>
 /// <item><c>--replicaof &lt;host&gt; &lt;port&gt;</c> — start as a replica of the given primary
 /// (default: standalone primary). The REPLICAOF command changes the target — or promotes with
 /// NO ONE — at runtime</item>
@@ -72,6 +74,49 @@ public sealed class ServerOptions
     /// <summary>Eviction policy applied when the dataset is over <see cref="MaxMemory"/>.</summary>
     public MaxMemoryPolicy MaxMemoryPolicy { get; init; } = MaxMemoryPolicy.NoEviction;
 
+    /// <summary>LFU counter logarithmic factor (--lfu-log-factor). Default 10, as in Redis.</summary>
+    public int LfuLogFactor { get; init; } = 10;
+
+    /// <summary>LFU counter decay period in minutes (--lfu-decay-time). Default 1, as in Redis.</summary>
+    public int LfuDecayTime { get; init; } = 1;
+
+    /// <summary>Cluster mode (--cluster-enabled yes): slot-checked dispatch with MOVED redirection.</summary>
+    public bool ClusterEnabled { get; init; }
+
+    /// <summary>
+    /// The static cluster slot map (--cluster-slots): every node's
+    /// ranges as <c>start-end@host:port</c> entries. This node is the
+    /// entry whose port equals <see cref="Port"/>. There is no gossip —
+    /// the map is the whole topology, identical on every node.
+    /// </summary>
+    public IReadOnlyList<ClusterNodeRange> ClusterSlots { get; init; } = Array.Empty<ClusterNodeRange>();
+
+    /// <summary>Parses a --cluster-slots value; malformed entries fail startup loudly.</summary>
+    public static IReadOnlyList<ClusterNodeRange> ParseClusterSlots(string text)
+    {
+        var ranges = new List<ClusterNodeRange>();
+        foreach (var entry in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var at = entry.LastIndexOf('@');
+            var colon = entry.LastIndexOf(':');
+            if (at < 0 || colon < at)
+                throw new ArgumentException($"Invalid --cluster-slots entry '{entry}': expected start-end@host:port.");
+            var bounds = entry[..at].Split('-');
+            if (bounds.Length != 2 ||
+                !int.TryParse(bounds[0], out var start) || !int.TryParse(bounds[1], out var end) ||
+                start < 0 || end >= ClusterSlot.SlotCount || start > end)
+                throw new ArgumentException($"Invalid --cluster-slots entry '{entry}': slot range must be within 0-{ClusterSlot.SlotCount - 1}.");
+            var host = entry[(at + 1)..colon];
+            if (host.Length == 0 || !int.TryParse(entry[(colon + 1)..], out var port) || port is < 1 or > 65535)
+                throw new ArgumentException($"Invalid --cluster-slots entry '{entry}': host or port is malformed.");
+            ranges.Add(new ClusterNodeRange(start, end, host, port));
+        }
+        if (ranges.Count == 0)
+            throw new ArgumentException("--cluster-slots must name at least one range.");
+        ranges.Sort((a, b) => a.Start.CompareTo(b.Start));
+        return ranges;
+    }
+
     /// <summary>Startup replication target (the REPLICAOF command can change it later); null = primary.</summary>
     public string? ReplicaOfHost { get; init; }
 
@@ -110,12 +155,14 @@ public sealed class ServerOptions
         "noeviction" => MaxMemoryPolicy.NoEviction,
         "allkeys-lru" => MaxMemoryPolicy.AllKeysLru,
         "allkeys-random" => MaxMemoryPolicy.AllKeysRandom,
+        "allkeys-lfu" => MaxMemoryPolicy.AllKeysLfu,
         "volatile-lru" => MaxMemoryPolicy.VolatileLru,
         "volatile-random" => MaxMemoryPolicy.VolatileRandom,
         "volatile-ttl" => MaxMemoryPolicy.VolatileTtl,
+        "volatile-lfu" => MaxMemoryPolicy.VolatileLfu,
         var other => throw new ArgumentException(
             $"Unsupported --maxmemory-policy '{other}'. Supported: noeviction, allkeys-lru, allkeys-random, " +
-            "volatile-lru, volatile-random, volatile-ttl (the LFU policies are not implemented).")
+            "allkeys-lfu, volatile-lru, volatile-random, volatile-ttl, volatile-lfu.")
     };
 
     public static ServerOptions FromArgs(string[] args)
@@ -129,6 +176,10 @@ public sealed class ServerOptions
         var requirePass = Environment.GetEnvironmentVariable("REDIS_REQUIREPASS");
         var maxMemory = 0L;
         var maxMemoryPolicy = MaxMemoryPolicy.NoEviction;
+        var lfuLogFactor = 10;
+        var lfuDecayTime = 1;
+        var clusterEnabled = false;
+        var clusterSlots = (IReadOnlyList<ClusterNodeRange>)Array.Empty<ClusterNodeRange>();
         var replicaOfHost = (string?)null;
         var replicaOfPort = 0;
         var masterAuth = Environment.GetEnvironmentVariable("REDIS_MASTERAUTH");
@@ -165,6 +216,18 @@ public sealed class ServerOptions
                     break;
                 case "--maxmemory-policy":
                     maxMemoryPolicy = ParseMaxMemoryPolicy(value);
+                    break;
+                case "--lfu-log-factor" when int.TryParse(value, out var parsedFactor) && parsedFactor >= 0:
+                    lfuLogFactor = parsedFactor;
+                    break;
+                case "--lfu-decay-time" when int.TryParse(value, out var parsedDecay) && parsedDecay >= 1:
+                    lfuDecayTime = parsedDecay;
+                    break;
+                case "--cluster-enabled":
+                    clusterEnabled = value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+                    break;
+                case "--cluster-slots":
+                    clusterSlots = ParseClusterSlots(value);
                     break;
                 case "--replicaof":
                     // Two values (host, port): the port is the argument
@@ -214,6 +277,10 @@ public sealed class ServerOptions
             RequirePass = string.IsNullOrEmpty(requirePass) ? null : requirePass,
             MaxMemory = maxMemory,
             MaxMemoryPolicy = maxMemoryPolicy,
+            LfuLogFactor = lfuLogFactor,
+            LfuDecayTime = lfuDecayTime,
+            ClusterEnabled = clusterEnabled,
+            ClusterSlots = clusterSlots,
             ReplicaOfHost = replicaOfHost,
             ReplicaOfPort = replicaOfPort,
             MasterAuth = string.IsNullOrEmpty(masterAuth) ? null : masterAuth,

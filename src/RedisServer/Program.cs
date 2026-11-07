@@ -35,7 +35,11 @@ builder.Services.AddSingleton(sp => new CommandProcessor(
     options.TlsPort,
     options.MaxMemory,
     options.MaxMemoryPolicy,
-    sp.GetRequiredService<ReplicationManager>()));
+    sp.GetRequiredService<ReplicationManager>(),
+    options.LfuLogFactor,
+    options.LfuDecayTime,
+    options.ClusterEnabled,
+    options.ClusterSlots));
 builder.Services.AddSingleton<TcpServer>();
 builder.Services.AddHostedService<RedisHostedService>();
 builder.Services.AddHostedService<MaintenanceService>();

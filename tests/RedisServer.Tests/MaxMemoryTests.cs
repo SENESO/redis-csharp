@@ -273,6 +273,6 @@ public sealed class MaxMemoryTests
         Assert.Equal(MaxMemoryPolicy.AllKeysLru, ServerOptions.ParseMaxMemoryPolicy("allkeys-lru"));
         Assert.Equal(MaxMemoryPolicy.VolatileTtl, ServerOptions.ParseMaxMemoryPolicy("volatile-ttl"));
         Assert.Equal(MaxMemoryPolicy.NoEviction, ServerOptions.ParseMaxMemoryPolicy("noeviction"));
-        Assert.Throws<ArgumentException>(() => ServerOptions.ParseMaxMemoryPolicy("allkeys-lfu"));
+        Assert.Throws<ArgumentException>(() => ServerOptions.ParseMaxMemoryPolicy("allkeys-fifo"));
     }
 }

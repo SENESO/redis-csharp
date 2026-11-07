@@ -57,6 +57,20 @@ public sealed class ClientContext
     /// </summary>
     public bool IsAuthenticated { get; set; }
 
+    /// <summary>
+    /// The ACL user this connection acts as. Assigned by the processor on
+    /// first use (the default user) and by AUTH afterwards. Rule changes
+    /// made with ACL SETUSER apply to the live user object, so a change
+    /// reaches connections already acting as that user.
+    /// </summary>
+    public AclUser? User { get; set; }
+
+    /// <summary>The logical database this connection has selected (SELECT); 0 until changed.</summary>
+    public int SelectedDb { get; set; }
+
+    /// <summary>Short form of <see cref="SelectedDb"/> for handler call sites.</summary>
+    public int Db => SelectedDb;
+
     public HashSet<byte[]> Channels { get; } = new(ByteArrayComparer.Instance);
 
     public HashSet<byte[]> Patterns { get; } = new(ByteArrayComparer.Instance);

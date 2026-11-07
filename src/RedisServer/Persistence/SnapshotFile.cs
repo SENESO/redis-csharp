@@ -14,8 +14,10 @@ public enum SnapshotLoadStatus
 /// optional deadline per key, sealed with a CRC-32. Format (all integers
 /// little-endian):
 /// <code>
-///   "RCDB" magic, uint32 format version (= 1)
+///   "RCDB" magic, uint32 format version (= 2)
 ///   per entry:
+///     byte  logical database index (version 2+; version 1 files have no
+///           such byte and every entry belongs to database 0)
 ///     byte  type tag (the RedisType values: 1 string, 2 list, 3 hash, 4 set, 5 zset)
 ///     byte  expiry flag (0/1); when 1, int64 expiry as Unix milliseconds
 ///     key:  int32 length + raw bytes
@@ -34,7 +36,7 @@ public enum SnapshotLoadStatus
 /// </summary>
 public static class SnapshotFile
 {
-    private const uint FormatVersion = 1;
+    private const uint FormatVersion = 2;
     private const byte EndMarker = 0xFF;
 
     /// <summary>
@@ -77,6 +79,7 @@ public static class SnapshotFile
 
     private static void WriteEntry(BinaryWriter writer, ExportedEntry entry)
     {
+        writer.Write((byte)entry.Db);
         writer.Write((byte)entry.Type);
         writer.Write(entry.ExpiresAt is not null);
         if (entry.ExpiresAt is { } expiry)
@@ -125,31 +128,172 @@ public static class SnapshotFile
 
     public static SnapshotLoadStatus TryRead(string path, out IReadOnlyList<ExportedEntry> entries, out string? error)
     {
-        entries = Array.Empty<ExportedEntry>();
+        var collected = new List<ExportedEntry>();
+        var status = StreamRead(path, collected.Add, out error);
+        entries = status == SnapshotLoadStatus.Loaded ? collected : Array.Empty<ExportedEntry>();
+        return status;
+    }
+
+    /// <summary>
+    /// Streams a snapshot file in bounded memory, delivering each entry
+    /// to <paramref name="onEntry"/> as it is parsed — the file is never
+    /// held whole (unlike <see cref="TryParse"/>, which serves the
+    /// replication wire path where the bytes already arrived as one
+    /// payload). The CRC is verified incrementally over the stream; a
+    /// failure can therefore surface after some entries were delivered,
+    /// and the caller owns discarding them (the startup load flushes
+    /// the store, keeping "corrupt ⇒ start empty" exact).
+    /// </summary>
+    public static SnapshotLoadStatus StreamRead(string path, Action<ExportedEntry> onEntry, out string? error)
+    {
         error = null;
         if (!File.Exists(path))
             return SnapshotLoadStatus.Missing;
 
-        byte[] all;
         try
         {
             // ReadWrite | Delete sharing, for the same Windows reason as
             // the AOF reader: File.ReadAllBytes shares for read only,
             // which both fails against a handle holding the file open and
             // blocks the atomic move-overwrite that replaces a snapshot.
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            using var raw = new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete);
-            using var copy = new MemoryStream();
-            stream.CopyTo(copy);
-            all = copy.ToArray();
+            using var window = new CrcWindowStream(raw);
+            using var reader = new BinaryReader(window);
+            var magic = reader.ReadBytes(4);
+            if (!magic.AsSpan().SequenceEqual("RCDB"u8))
+            {
+                error = "malformed snapshot: bad magic";
+                return SnapshotLoadStatus.Corrupt;
+            }
+            var version = reader.ReadUInt32();
+            if (version is not (1 or 2))
+            {
+                error = $"malformed snapshot: unsupported format version {version}";
+                return SnapshotLoadStatus.Corrupt;
+            }
+            ReadEntries(reader, version, onEntry);
+
+            // The 4 trailer bytes are the stored CRC; reading them
+            // through the window pushes the last payload bytes into the
+            // computed CRC, completing it.
+            var stored = reader.ReadBytes(4);
+            if (stored.Length < 4)
+            {
+                error = "malformed snapshot: truncated CRC trailer";
+                return SnapshotLoadStatus.Corrupt;
+            }
+            if (window.Crc != BitConverter.ToUInt32(stored))
+            {
+                error = "CRC mismatch — the file is damaged";
+                return SnapshotLoadStatus.Corrupt;
+            }
+            if (raw.ReadByte() != -1)
+            {
+                error = "malformed snapshot: trailing bytes after the CRC";
+                return SnapshotLoadStatus.Corrupt;
+            }
+            return SnapshotLoadStatus.Loaded;
+        }
+        catch (EndOfStreamException)
+        {
+            error = "malformed snapshot: unexpected end of file";
+            return SnapshotLoadStatus.Corrupt;
+        }
+        catch (InvalidDataException ex)
+        {
+            error = $"malformed snapshot: {ex.Message}";
+            return SnapshotLoadStatus.Corrupt;
         }
         catch (Exception ex)
         {
             error = $"could not read the file: {ex.Message}";
             return SnapshotLoadStatus.Corrupt;
         }
+    }
 
-        return TryParse(all, out entries, out error);
+    /// <summary>
+    /// A read-only stream wrapper that computes the CRC-32 of every
+    /// byte read except the most recent four — the snapshot's trailer
+    /// is a 4-byte CRC over everything before it, so the trailer bytes
+    /// themselves must stay out of the sum until they are known not to
+    /// be payload. Reading the trailer through the wrapper completes
+    /// the payload CRC.
+    /// </summary>
+    private sealed class CrcWindowStream : Stream
+    {
+        private const int WindowSize = 4;
+
+        private readonly Stream _inner;
+        private readonly byte[] _tail = new byte[WindowSize];
+        private int _tailCount;
+        private Crc32.Accumulator _crc = new();
+
+        public CrcWindowStream(Stream inner) => _inner = inner;
+
+        public uint Crc => _crc.Value;
+
+        /// <summary>
+        /// Feeds one read chunk into the CRC, holding back only the
+        /// newest <see cref="WindowSize"/> bytes overall: everything
+        /// older than the window is certainly payload.
+        /// </summary>
+        private void Feed(ReadOnlySpan<byte> chunk)
+        {
+            if (chunk.Length >= WindowSize)
+            {
+                // The whole held tail is payload now, plus all of this
+                // chunk except its last WindowSize bytes.
+                _crc = _crc.Append(_tail.AsSpan(0, _tailCount));
+                _crc = _crc.Append(chunk[..^WindowSize]);
+                chunk[^WindowSize..].CopyTo(_tail);
+                _tailCount = WindowSize;
+            }
+            else if (_tailCount + chunk.Length > WindowSize)
+            {
+                // Part of the held tail overflows into the payload.
+                var overflow = _tailCount + chunk.Length - WindowSize;
+                _crc = _crc.Append(_tail.AsSpan(0, overflow));
+                _tail.AsSpan(overflow, _tailCount - overflow).CopyTo(_tail);
+                chunk.CopyTo(_tail.AsSpan(_tailCount - overflow));
+                _tailCount = WindowSize;
+            }
+            else
+            {
+                chunk.CopyTo(_tail.AsSpan(_tailCount));
+                _tailCount += chunk.Length;
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = _inner.Read(buffer, offset, count);
+            if (read > 0)
+                Feed(buffer.AsSpan(offset, read));
+            return read;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            var read = _inner.Read(buffer);
+            if (read > 0)
+                Feed(buffer[..read]);
+            return read;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     /// <summary>
@@ -199,15 +343,42 @@ public static class SnapshotFile
         if (!magic.AsSpan().SequenceEqual("RCDB"u8))
             throw new InvalidDataException("bad magic");
         var version = reader.ReadUInt32();
-        if (version != FormatVersion)
+        if (version is not (1 or 2))
             throw new InvalidDataException($"unsupported format version {version}");
 
         var entries = new List<ExportedEntry>();
+        ReadEntries(reader, version, entries.Add);
+
+        if (stream.Position != stream.Length)
+            throw new InvalidDataException("trailing bytes after the end marker");
+        return entries;
+    }
+
+    /// <summary>
+    /// Reads entries until the end marker, delivering each one. Shared
+    /// by the whole-buffer parse and the streaming file read. Version 2
+    /// prefixes each entry with its database index; in version 1 the
+    /// first byte is the type tag itself and the database is 0.
+    /// </summary>
+    private static void ReadEntries(BinaryReader reader, uint version, Action<ExportedEntry> sink)
+    {
         while (true)
         {
-            var tag = reader.ReadByte();
-            if (tag == EndMarker)
+            var first = reader.ReadByte();
+            if (first == EndMarker)
                 break;
+            int db;
+            byte tag;
+            if (version >= 2)
+            {
+                db = first;
+                tag = reader.ReadByte();
+            }
+            else
+            {
+                db = 0;
+                tag = first;
+            }
             var type = (RedisType)tag;
             var hasExpiry = reader.ReadBoolean();
             DateTimeOffset? expiry = hasExpiry
@@ -222,12 +393,8 @@ public static class SnapshotFile
                 RedisType.ZSet => ReadZSet(reader),
                 _ => throw new InvalidDataException($"unknown type tag {tag}")
             };
-            entries.Add(new ExportedEntry(key, type, value, expiry));
+            sink(new ExportedEntry(key, type, value, expiry, db));
         }
-
-        if (stream.Position != stream.Length)
-            throw new InvalidDataException("trailing bytes after the end marker");
-        return entries;
     }
 
     private static byte[] ReadBlob(BinaryReader reader)

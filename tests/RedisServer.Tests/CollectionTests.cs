@@ -49,11 +49,11 @@ public class CollectionTests
     {
         var store = NewStore();
         store.RightPush(B("l"), new[] { B("a"), B("b"), B("c") });
-        Assert.Equal(new[] { "a", "b" }, Strings(store.LeftPop(B("l"), 2)));
-        Assert.Equal(new[] { "c" }, Strings(store.RightPop(B("l"), 5)));
+        Assert.Equal(new[] { "a", "b" }, Strings(store.LeftPop(B("l"), 2L)));
+        Assert.Equal(new[] { "c" }, Strings(store.RightPop(B("l"), 5L)));
         Assert.Equal(RedisType.None, store.TypeOf(B("l"))); // empty collection keys are removed
         Assert.Null(store.LeftPop(B("l")));
-        Assert.Empty(store.LeftPop(B("l"), 3));
+        Assert.Empty(store.LeftPop(B("l"), 3L));
     }
 
     // ---------------- Sets ----------------
