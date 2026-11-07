@@ -264,4 +264,174 @@ public class PersistenceTests : IDisposable
         Assert.StartsWith("-ERR", reply);
         node.Persistence.Dispose();
     }
+
+    [Fact]
+    public void Snapshot_PreservesExpiry_ForEveryType()
+    {
+        var node = Boot(appendOnly: false);
+        Exec(node, "SET", "str", "v");
+        Exec(node, "RPUSH", "list", "a");
+        Exec(node, "SADD", "set", "m");
+        Exec(node, "HSET", "hash", "f", "v");
+        Exec(node, "ZADD", "zset", "1", "m");
+        foreach (var key in new[] { "str", "list", "set", "hash", "zset" })
+            Assert.Equal(":1\r\n", Exec(node, "EXPIRE", key, "3600"));
+        node.Persistence.SaveSnapshot(node.Store);
+        node.Persistence.Dispose();
+
+        var restarted = Boot(appendOnly: false);
+        Assert.Equal(5, restarted.Store.Count);
+        foreach (var key in new[] { "str", "list", "set", "hash", "zset" })
+            Assert.InRange(restarted.Store.TtlMilliseconds(B(key)), 3_500_000, 3_600_000);
+        Assert.Equal("a", S(restarted.Store.ListIndex(B("list"), 0)));
+        Assert.Equal("v", S(restarted.Store.HashGet(B("hash"), B("f"))));
+        Assert.Equal(1.0, restarted.Store.ZScore(B("zset"), B("m")));
+
+        // And the deadlines still bite after the restart.
+        restarted.Clock.Advance(TimeSpan.FromSeconds(3601));
+        restarted.Store.RunMaintenance();
+        Assert.Equal(0, restarted.Store.Count);
+        restarted.Persistence.Dispose();
+    }
+
+    [Fact]
+    public void Aof_PreservesExpiry_OnCollectionKeys()
+    {
+        var node = Boot(appendOnly: true);
+        Exec(node, "RPUSH", "list", "a", "b");
+        Assert.Equal(":1\r\n", Exec(node, "EXPIRE", "list", "3600"));
+        Exec(node, "HSET", "hash", "f", "v");
+        var deadlineMs = node.Clock.GetUtcNow().AddHours(2).ToUnixTimeMilliseconds();
+        Assert.Equal(":1\r\n", Exec(node, "PEXPIREAT", "hash", deadlineMs.ToString()));
+        node.Persistence.Dispose();
+
+        var restarted = Boot(appendOnly: true);
+        Assert.Equal(2, restarted.Store.ListLength(B("list")));
+        Assert.True(restarted.Store.TryGetExpiry(B("list"), out var listExpiry) && listExpiry is not null);
+        Assert.True(restarted.Store.TryGetExpiry(B("hash"), out var hashExpiry) && hashExpiry is not null);
+        Assert.Equal("v", S(restarted.Store.HashGet(B("hash"), B("f"))));
+        restarted.Persistence.Dispose();
+    }
+
+    [Fact]
+    public void Aof_WinsOverSnapshot_WhenBothPresent()
+    {
+        // State 1: only a snapshot exists.
+        var first = Boot(appendOnly: false);
+        Exec(first, "SET", "snap-only", "1");
+        Assert.Equal("+OK\r\n", Exec(first, "SAVE"));
+        first.Persistence.Dispose();
+
+        // State 2: booted with the AOF enabled (the snapshot loads, since
+        // no AOF exists yet), then a write lands in the AOF.
+        var second = Boot(appendOnly: true);
+        Exec(second, "SET", "aof-only", "2");
+        second.Persistence.Dispose();
+
+        // With the AOF enabled it is the source of truth: it replays from
+        // empty, so the snapshot's key does not come back.
+        var third = Boot(appendOnly: true);
+        Assert.Equal("2", S(third.Store.Get(B("aof-only"))));
+        Assert.Null(third.Store.Get(B("snap-only")));
+        Assert.Equal(1, third.Store.Count);
+        third.Persistence.Dispose();
+
+        // Without the AOF, the snapshot is still there and still loads.
+        var fourth = Boot(appendOnly: false);
+        Assert.Equal("1", S(fourth.Store.Get(B("snap-only"))));
+        Assert.Null(fourth.Store.Get(B("aof-only")));
+        fourth.Persistence.Dispose();
+    }
+
+    [Fact]
+    public void Aof_Rewrite_PreservesExpiries()
+    {
+        var node = Boot(appendOnly: true);
+        Exec(node, "SET", "temp", "v", "EX", "3600");
+        Exec(node, "SET", "stable", "v");
+        var reply = Exec(node, "BGREWRITEAOF");
+        Assert.StartsWith("+Background append only file rewriting started", reply);
+        node.Persistence.Dispose();
+
+        var restarted = Boot(appendOnly: true);
+        Assert.Equal("v", S(restarted.Store.Get(B("temp"))));
+        Assert.InRange(restarted.Store.TtlMilliseconds(B("temp")), 3_500_000, 3_600_000);
+        Assert.Equal("v", S(restarted.Store.Get(B("stable"))));
+        Assert.Equal(-1, restarted.Store.TtlMilliseconds(B("stable")));
+        restarted.Persistence.Dispose();
+    }
+
+    [Fact]
+    public void Save_AndBgSave_ViaCommands_WriteTheSnapshotFile()
+    {
+        var node = Boot(appendOnly: false);
+        Exec(node, "SET", "k", "v");
+        var path = Path.Combine(_dir, "dump.rcdb");
+
+        Assert.Equal("+OK\r\n", Exec(node, "SAVE"));
+        Assert.True(File.Exists(path));
+
+        File.Delete(path);
+        Assert.Equal("+Background saving started\r\n", Exec(node, "BGSAVE"));
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!File.Exists(path) && DateTime.UtcNow < deadline)
+            Thread.Sleep(50);
+        Assert.True(File.Exists(path));
+        node.Persistence.Dispose();
+    }
+
+    [Fact]
+    public async Task Aof_Rewrite_UnderConcurrentWrites_ReplaysToExactState()
+    {
+        var clock = new FakeTimeProvider();
+        var stats = new RedisStats();
+        var store = new RedisStore(clock, stats);
+        var options = new ServerOptions
+        {
+            Port = 0,
+            DataDirectory = _dir,
+            AppendOnly = true,
+            AppendFsync = AofFsyncPolicy.Always
+        };
+        var persistence = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
+        var processor = new CommandProcessor(store, stats, clock, persistence, new PubSubHub(), port: 0);
+
+        const int workers = 4, perWorker = 150;
+        var tasks = Enumerable.Range(0, workers).Select(w => Task.Run(() =>
+        {
+            var ctx = new ClientContext();
+            var sink = new ArrayBufferWriter<byte>();
+            for (var i = 0; i < perWorker; i++)
+            {
+                processor.Execute(new[] { B("SET"), B($"w{w}:k{i}"), B($"v{i}") }, ctx, sink);
+                processor.Execute(new[] { B("INCR"), B("shared") }, ctx, sink);
+            }
+        })).ToArray();
+
+        // Rewrite repeatedly while the writers are mid-flight: appends
+        // racing the file swap must not be lost or duplicated.
+        var rewrites = 0;
+        while (!Task.WhenAll(tasks).IsCompleted && rewrites < 200)
+        {
+            var sink = new ArrayBufferWriter<byte>();
+            processor.Execute(new[] { B("BGREWRITEAOF") }, new ClientContext(), sink);
+            rewrites++;
+            await Task.Delay(1);
+        }
+        await Task.WhenAll(tasks);
+        Assert.True(rewrites > 0);
+        persistence.Dispose();
+
+        var stats2 = new RedisStats();
+        var store2 = new RedisStore(clock, stats2);
+        var persistence2 = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
+        var processor2 = new CommandProcessor(store2, stats2, clock, persistence2, new PubSubHub(), port: 0);
+        persistence2.Load(store2, processor2.ExecuteReplay);
+        persistence2.Dispose();
+
+        Assert.Equal((workers * perWorker).ToString(), S(store2.Get(B("shared"))));
+        Assert.Equal(workers * perWorker + 1, store2.Count);
+        for (var w = 0; w < workers; w++)
+            Assert.Equal($"v{perWorker - 1}", S(store2.Get(B($"w{w}:k{perWorker - 1}"))));
+    }
 }

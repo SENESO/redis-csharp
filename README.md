@@ -18,7 +18,7 @@ Redis looks like "just a key/value store" from the outside, but building one pro
 
 **Strings** — `SET` (with `EX` / `PX` / `NX` / `XX` / `GET` / `KEEPTTL`), `GET`, `DEL`, `EXISTS`, `INCR` / `DECR` / `INCRBY` / `DECRBY`, `APPEND`, `STRLEN`
 
-**Keys** — `EXPIRE` / `PEXPIRE` (with `NX` / `XX` / `GT` / `LT`), `PEXPIREAT`, `TTL` / `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN` (with `MATCH` / `COUNT` / `TYPE`), `FLUSHDB` / `FLUSHALL`
+**Keys** — `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` (with `NX` / `XX` / `GT` / `LT`), `TTL` / `PTTL`, `PERSIST`, `TYPE`, `KEYS`, `SCAN` (with `MATCH` / `COUNT` / `TYPE`), `FLUSHDB` / `FLUSHALL`
 
 **Lists** — `LPUSH` / `RPUSH`, `LPOP` / `RPOP` (with count), `LLEN`, `LRANGE`, `LINDEX`
 
@@ -108,6 +108,7 @@ tests/RedisServer.Tests/
     ExpiryTests.cs                 Fake-clock expiry: lazy, swept, TTL -1/-2, KEEPTTL
     PersistenceTests.cs            Snapshot round-trips, CRC corruption, AOF replay/rewrite, torn tails
     ProtocolTests.cs               Wire-level sessions over in-memory transport: exact reply bytes
+    WireGapTests.cs                Redis-exact option/error matrices: WRONGTYPE sweep, SET/EXPIRE/ZADD edges
     TransactionTests.cs            MULTI/EXEC/DISCARD, EXECABORT, runtime-error semantics
     PubSubTests.cs                 Channels, patterns, delivery counts, restricted mode
     ConcurrencyTests.cs            Parallel INCR exactness, mixed load vs the sweep, AOF under parallelism
@@ -136,22 +137,30 @@ Design notes worth knowing:
 dotnet test
 ```
 
-67 tests: store semantics per type, fake-clock expiry, persistence round-trips (including CRC corruption, AOF rewrite equivalence, and torn-tail recovery), exact wire bytes for commands/transactions/pub/sub over an in-memory transport, and concurrency stress (8 workers × 250 parallel `INCR` must total exactly 2,000; AOF replay after 8-way parallel writes must reproduce the state exactly).
+92 tests: store semantics per type, fake-clock expiry, persistence round-trips (including CRC corruption, AOF rewrite equivalence, torn-tail recovery, expiry persisted across restarts for every type, snapshot/AOF load precedence both ways, and an AOF rewrite racing concurrent writers), exact wire bytes for commands/transactions/pub/sub over an in-memory transport, a `WRONGTYPE` sweep across the type families, the full `SET` / `EXPIRE` / `ZADD` option matrices, arity and syntax error paths, and concurrency stress (8 workers × 250 parallel `INCR` must total exactly 2,000; AOF replay after 8-way parallel writes must reproduce the state exactly).
+
+A follow-up audit also compared edge and error semantics command-by-command against a real redis-server 7.0.15; every deviation found (nine — from `SET ... GET` answering the old value when the write is declined, to Redis's two distinct `ZADD` option-conflict messages) was fixed and pinned by a test.
 
 The running server was also driven end-to-end by an independent raw-socket RESP client (a scripted checklist of 80 checks covering every command family, transactions, a pub/sub round-trip, and error texts): **80/80 passed**, plus restart-recovery checks — AOF recovery, snapshot-only recovery, and survival of a `kill -9` with `--appendfsync always` — all passed.
 
 ## Benchmark
 
-Loopback, one connection, 50,000 requests per cell (1,000 warmup), every reply parsed. Measured on a shared 4-vCPU AMD EPYC VM (Linux, .NET 8) under parallel load, so treat the numbers as indicative, not peak:
+Head-to-head against the real thing. The same loopback method was driven against this server and **redis-server 7.0.15** on the same machine, in the same session, by the same driver — one connection, 1,000 warmup requests, 50,000 requests per cell, every reply parsed. Both servers ran with persistence off. Figures are the median of three runs, rounded; the machine is a shared sandbox VM under parallel load, so treat them as indicative, not peak:
 
-| Test | Pipeline 1 | Pipeline 50 |
-|------|-----------:|------------:|
-| SET | 10,995 ops/s | 91,469 ops/s |
-| GET | 12,315 ops/s | 92,844 ops/s |
-| INCR | 12,250 ops/s | 85,791 ops/s |
-| LPUSH | 12,606 ops/s | 83,285 ops/s |
+| Test | Pipeline | redis-csharp | Redis 7.0.15 |
+|------|---------:|-------------:|-------------:|
+| SET | 1 | 14,000 ops/s | 34,300 ops/s |
+| SET | 50 | 79,900 ops/s | 706,000 ops/s |
+| GET | 1 | 15,700 ops/s | 34,300 ops/s |
+| GET | 50 | 87,100 ops/s | 540,100 ops/s |
+| INCR | 1 | 16,000 ops/s | 34,100 ops/s |
+| INCR | 50 | 93,500 ops/s | 797,700 ops/s |
+| LPUSH | 1 | 18,100 ops/s | 35,500 ops/s |
+| LPUSH | 50 | 82,800 ops/s | 620,000 ops/s |
 
-Method note: the numbers were produced by a Python raw-socket driver implementing exactly the method above — this sandbox blocks direct TCP from .NET processes, so the C# benchmark tool in `tools/RedisBenchmark` (same method, same defaults) could not run here; it runs on any unrestricted machine. Pipeline depth 1 is round-trip-latency bound; depth 50 shows the server's batched throughput. No real `redis-server` binary exists on this machine, so a head-to-head comparison against real Redis is **pending**, not claimed.
+Read plainly: Redis is roughly 2–2.5× faster unpipelined and 6–9× faster pipelined. That is the expected gap between a managed, deliberately single-writer design and three decades of C optimization — this project aims for protocol fidelity and correctness, not for beating Redis at throughput.
+
+Method note: the numbers were produced by a Python raw-socket driver implementing exactly the method above — this sandbox blocks direct TCP from .NET processes, so the C# benchmark tool in `tools/RedisBenchmark` (same method, same defaults) could not run here; it runs on any unrestricted machine.
 
 ## Future work
 

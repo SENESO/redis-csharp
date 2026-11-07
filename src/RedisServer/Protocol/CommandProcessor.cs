@@ -93,7 +93,8 @@ public sealed partial class CommandProcessor
         // Keys
         Add("EXPIRE", 3, 4, Expire);
         Add("PEXPIRE", 3, 4, PExpire);
-        Add("PEXPIREAT", 3, 3, PExpireAt);
+        Add("EXPIREAT", 3, 4, ExpireAt);
+        Add("PEXPIREAT", 3, 4, PExpireAt);
         Add("TTL", 2, 2, Ttl);
         Add("PTTL", 2, 2, PTtl);
         Add("PERSIST", 2, 2, Persist);
@@ -438,7 +439,9 @@ public sealed partial class CommandProcessor
 
         if (builder.Length == 0)
         {
-            RespWriter.WriteError(output, $"ERR unknown section '{RespParser.Describe(args[1])}'");
+            // An unknown section is not an error in Redis: the reply is
+            // an empty bulk string.
+            RespWriter.WriteBulkString(output, "");
             return;
         }
         RespWriter.WriteBulkString(output, builder.ToString());
@@ -577,7 +580,9 @@ public sealed partial class CommandProcessor
         }
 
         if (returnOld)
-            RespWriter.WriteBulkStringOrNull(output, outcome == SetOutcome.Stored ? oldValue : null);
+            // Redis returns the old value even when NX/XX declined the
+            // write; only a missing key answers nil.
+            RespWriter.WriteBulkStringOrNull(output, oldValue);
         else if (outcome == SetOutcome.Stored)
             RespWriter.WriteSimpleString(output, "OK");
         else
@@ -618,7 +623,7 @@ public sealed partial class CommandProcessor
     {
         var amount = ParseLong(args[2]);
         if (amount == long.MinValue)
-            throw ValueErrorException.Overflow();
+            throw new ValueErrorException("ERR decrement would overflow");
         Delta(args, -amount, output, effects);
     }
 
@@ -651,15 +656,40 @@ public sealed partial class CommandProcessor
 
     private void ExpireCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects)
     {
-        var key = args[1];
         var amount = ParseLong(args[2]);
         var candidate = milliseconds
             ? _clock.GetUtcNow() + TimeSpan.FromMilliseconds(amount)
             : _clock.GetUtcNow() + TimeSpan.FromSeconds(amount);
+        ConditionalDeadline(args, candidate, output, effects);
+    }
 
+    private void ExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+        ExpireAtCore(args, milliseconds: false, output, effects);
+
+    private void PExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+        ExpireAtCore(args, milliseconds: true, output, effects);
+
+    private void ExpireAtCore(byte[][] args, bool milliseconds, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        var unix = ParseLong(args[2]);
+        var candidate = milliseconds
+            ? DateTimeOffset.FromUnixTimeMilliseconds(unix)
+            : DateTimeOffset.FromUnixTimeSeconds(unix);
+        ConditionalDeadline(args, candidate, output, effects);
+    }
+
+    /// <summary>
+    /// The shared tail of the EXPIRE family: validate the optional
+    /// NX / XX / GT / LT condition against the key's current deadline,
+    /// then apply the candidate deadline (which may delete the key when
+    /// it already lies in the past).
+    /// </summary>
+    private void ConditionalDeadline(byte[][] args, DateTimeOffset candidate, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        var key = args[1];
         var condition = args.Length == 4 ? NameOf(args[3]) : null;
         if (condition is not (null or "NX" or "XX" or "GT" or "LT"))
-            throw SyntaxError();
+            throw new RedisCommandException($"ERR Unsupported option {RespParser.Describe(args[3])}");
 
         if (!_store.TryGetExpiry(key, out var current))
         {
@@ -683,18 +713,6 @@ public sealed partial class CommandProcessor
             return;
         }
 
-        ApplyDeadline(key, candidate, output, effects);
-    }
-
-    private void PExpireAt(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
-    {
-        var key = args[1];
-        if (!_store.TryGetExpiry(key, out _))
-        {
-            RespWriter.WriteInteger(output, 0);
-            return;
-        }
-        var candidate = DateTimeOffset.FromUnixTimeMilliseconds(ParseLong(args[2]));
         ApplyDeadline(key, candidate, output, effects);
     }
 

@@ -188,7 +188,7 @@ public sealed partial class RedisStore
     // ------------------------------------------------------------------
 
     public ZAddResult ZAdd(byte[] key, ZAddMode mode, bool countChanged, bool increment,
-        IReadOnlyList<(double Score, byte[] Member)> items)
+        IReadOnlyList<(double Score, byte[] Member)> items, bool requireExisting = false)
     {
         lock (_gate)
         {
@@ -199,7 +199,7 @@ public sealed partial class RedisStore
             {
                 var (delta, member) = items[0];
                 var exists = zset.Scores.TryGetValue(member, out var current);
-                if (!exists && mode == ZAddMode.OnlyExisting)
+                if (!exists && (mode == ZAddMode.OnlyExisting || requireExisting))
                     return new ZAddResult(0, 0, null);
                 if (exists && mode == ZAddMode.OnlyNew)
                     return new ZAddResult(0, 0, null);
@@ -224,7 +224,7 @@ public sealed partial class RedisStore
                 var exists = zset.Scores.TryGetValue(member, out var current);
                 if (!exists)
                 {
-                    if (mode == ZAddMode.OnlyExisting)
+                    if (mode == ZAddMode.OnlyExisting || requireExisting)
                         continue;
                     ApplyZScore(zset, member, score);
                     added++;

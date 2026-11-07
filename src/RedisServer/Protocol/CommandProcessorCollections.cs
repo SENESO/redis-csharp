@@ -54,8 +54,8 @@ public sealed partial class CommandProcessor
                     if (i + 1 >= args.Length)
                         throw SyntaxError();
                     count = ParseLong(args[++i]);
-                    if (count <= 0)
-                        throw new RedisCommandException("ERR value is not an integer or out of range");
+                    if (count < 1)
+                        throw SyntaxError();
                     break;
                 case "TYPE":
                     if (i + 1 >= args.Length)
@@ -185,8 +185,7 @@ public sealed partial class CommandProcessor
             return;
         }
 
-        var count = ParseLong(args[2]);
-        if (count < 0)
+        if (!RedisStore.TryParseStrictLong(args[2], out var count) || count < 0)
             throw new ValueErrorException("ERR value is out of range, must be positive");
         if (_store.TypeOf(key) == RedisType.None)
         {
@@ -299,46 +298,39 @@ public sealed partial class CommandProcessor
 
     private void ZAdd(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
-        var mode = ZAddMode.None;
+        var nx = false;
+        var xx = false;
+        var gt = false;
+        var lt = false;
         var countChanged = false;
         var increment = false;
         var i = 2;
         for (; i < args.Length; i++)
         {
             var option = NameOf(args[i]);
-            var isOption = option is "NX" or "XX" or "GT" or "LT" or "CH" or "INCR";
-            if (!isOption)
+            if (option is not ("NX" or "XX" or "GT" or "LT" or "CH" or "INCR"))
                 break;
             switch (option)
             {
-                case "NX":
-                    if (mode is ZAddMode.OnlyExisting or ZAddMode.GreaterThan or ZAddMode.LessThan)
-                        throw new RedisCommandException("ERR GT, LT, and/or NX options are mutually exclusive");
-                    mode = ZAddMode.OnlyNew;
-                    break;
-                case "XX":
-                    if (mode == ZAddMode.OnlyNew)
-                        throw new RedisCommandException("ERR GT, LT, and/or NX options are mutually exclusive");
-                    mode = ZAddMode.OnlyExisting;
-                    break;
-                case "GT":
-                    if (mode == ZAddMode.OnlyNew)
-                        throw new RedisCommandException("ERR GT, LT, and/or NX options are mutually exclusive");
-                    mode = ZAddMode.GreaterThan;
-                    break;
-                case "LT":
-                    if (mode == ZAddMode.OnlyNew)
-                        throw new RedisCommandException("ERR GT, LT, and/or NX options are mutually exclusive");
-                    mode = ZAddMode.LessThan;
-                    break;
-                case "CH":
-                    countChanged = true;
-                    break;
-                case "INCR":
-                    increment = true;
-                    break;
+                case "NX": nx = true; break;
+                case "XX": xx = true; break;
+                case "GT": gt = true; break;
+                case "LT": lt = true; break;
+                case "CH": countChanged = true; break;
+                case "INCR": increment = true; break;
             }
         }
+
+        if (nx && xx)
+            throw new RedisCommandException("ERR XX and NX options at the same time are not compatible");
+        if ((gt && lt) || (nx && (gt || lt)))
+            throw new RedisCommandException("ERR GT, LT, and/or NX options at the same time are not compatible");
+
+        var mode = nx ? ZAddMode.OnlyNew
+            : gt ? ZAddMode.GreaterThan
+            : lt ? ZAddMode.LessThan
+            : xx ? ZAddMode.OnlyExisting
+            : ZAddMode.None;
 
         var pairArgs = args.Length - i;
         if (pairArgs <= 0 || pairArgs % 2 != 0 || (increment && pairArgs != 2))
@@ -355,7 +347,7 @@ public sealed partial class CommandProcessor
             items.Add((score, args[j + 1]));
         }
 
-        var result = _store.ZAdd(args[1], mode, countChanged, increment, items);
+        var result = _store.ZAdd(args[1], mode, countChanged, increment, items, requireExisting: xx);
         effects.Add(args);
         if (increment)
         {

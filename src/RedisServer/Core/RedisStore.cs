@@ -306,6 +306,8 @@ public sealed partial class RedisStore
         }
         if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
             return false;
+        if (double.IsInfinity(value))
+            return false; // overflow such as 1e309: only the literal inf spellings above are valid
         return !double.IsNaN(value); // Redis rejects NaN scores outright
     }
 

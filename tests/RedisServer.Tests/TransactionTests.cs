@@ -105,4 +105,37 @@ public class TransactionTests
         await c.SendCommandAsync("GET", "y");
         await c.ExpectAsync("$2\r\nok\r\n"); // Redis does not roll back — documented behaviour
     }
+
+    [Fact]
+    public async Task PubSubCommandInsideMulti_IsAQueueTimeError()
+    {
+        // Deliberate restriction of this server (real Redis queues them):
+        // pub/sub commands fail validation while queueing, which aborts
+        // the whole transaction at EXEC.
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("MULTI");
+        await c.ExpectAsync("+OK\r\n");
+        await c.SendCommandAsync("PUBLISH", "chan", "msg");
+        await c.ExpectAsync("-ERR PUBLISH is not allowed inside a transaction\r\n");
+        await c.SendCommandAsync("EXEC");
+        await c.ExpectAsync("-EXECABORT Transaction discarded because of previous errors.\r\n");
+    }
+
+    [Fact]
+    public async Task UnknownCommandInsideMulti_AbortsExec()
+    {
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("MULTI");
+        await c.ExpectAsync("+OK\r\n");
+        await c.SendCommandAsync("SET", "a", "1");
+        await c.ExpectAsync("+QUEUED\r\n");
+        await c.SendCommandAsync("NOSUCH", "x");
+        await c.ExpectAsync("-ERR unknown command 'NOSUCH', with args beginning with: 'x'\r\n");
+        await c.SendCommandAsync("EXEC");
+        await c.ExpectAsync("-EXECABORT Transaction discarded because of previous errors.\r\n");
+        await c.SendCommandAsync("GET", "a");
+        await c.ExpectAsync("$-1\r\n");
+    }
 }

@@ -98,4 +98,82 @@ public class PubSubTests
         await fresh.SendCommandAsync("UNSUBSCRIBE"); // nothing to remove: one null-channel reply
         await fresh.ExpectAsync("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
     }
+
+    [Fact]
+    public async Task DirectAndPattern_BothDeliver_AndPublishCountsTwice()
+    {
+        await using var h = SessionHarness.Start();
+        var sub = h.Connect();
+        var pub = h.Connect();
+
+        await sub.SendCommandAsync("SUBSCRIBE", "news");
+        await sub.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n");
+        await sub.SendCommandAsync("PSUBSCRIBE", "n*");
+        await sub.ExpectAsync("*3\r\n$10\r\npsubscribe\r\n$2\r\nn*\r\n:2\r\n");
+
+        await pub.SendCommandAsync("PUBLISH", "news", "ping");
+        await pub.ExpectAsync(":2\r\n"); // reached twice: directly and by pattern, as in Redis
+        await sub.ExpectAsync("*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$4\r\nping\r\n");
+        await sub.ExpectAsync("*4\r\n$8\r\npmessage\r\n$2\r\nn*\r\n$4\r\nnews\r\n$4\r\nping\r\n");
+    }
+
+    [Fact]
+    public async Task SubscribeSameChannelTwice_CountStaysOne()
+    {
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("SUBSCRIBE", "dup");
+        await c.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$3\r\ndup\r\n:1\r\n");
+        await c.SendCommandAsync("SUBSCRIBE", "dup");
+        await c.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$3\r\ndup\r\n:1\r\n"); // confirmed again, not double-counted
+    }
+
+    [Fact]
+    public async Task Unsubscribe_NeverHeldChannel_RepliesWithNameAndCurrentCount()
+    {
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("SUBSCRIBE", "room");
+        await c.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$4\r\nroom\r\n:1\r\n");
+        await c.SendCommandAsync("UNSUBSCRIBE", "never-held");
+        await c.ExpectAsync("*3\r\n$11\r\nunsubscribe\r\n$10\r\nnever-held\r\n:1\r\n");
+    }
+
+    [Fact]
+    public async Task PunsubscribeAllPatterns_AndPunsubscribeWithNoPatterns()
+    {
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("PSUBSCRIBE", "x*", "y*");
+        await c.ExpectAsync(
+            "*3\r\n$10\r\npsubscribe\r\n$2\r\nx*\r\n:1\r\n" +
+            "*3\r\n$10\r\npsubscribe\r\n$2\r\ny*\r\n:2\r\n");
+        await c.SendCommandAsync("PUNSUBSCRIBE");
+        var first = Assert.IsType<List<object?>>(await c.ReadReplyAsync());
+        var second = Assert.IsType<List<object?>>(await c.ReadReplyAsync());
+        var seen = new HashSet<string>
+        {
+            $"{first[1]}:{first[2]}",
+            $"{second[1]}:{second[2]}"
+        };
+        Assert.Equal(new HashSet<string> { "x*:1", "y*:0" }, seen); // order between the two is the hub's
+
+        // No patterns left: one null-pattern reply, and the count still
+        // includes the client's channel subscriptions (as in Redis).
+        await c.SendCommandAsync("SUBSCRIBE", "room");
+        await c.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$4\r\nroom\r\n:1\r\n");
+        await c.SendCommandAsync("PUNSUBSCRIBE");
+        await c.ExpectAsync("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:1\r\n");
+    }
+
+    [Fact]
+    public async Task SubscribedPing_WithMessage_AnswersTheMessage()
+    {
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+        await c.SendCommandAsync("SUBSCRIBE", "room");
+        await c.ExpectAsync("*3\r\n$9\r\nsubscribe\r\n$4\r\nroom\r\n:1\r\n");
+        await c.SendCommandAsync("PING", "hello");
+        await c.ExpectAsync("*2\r\n$4\r\npong\r\n$5\r\nhello\r\n");
+    }
 }
