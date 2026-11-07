@@ -1,5 +1,6 @@
 using RedisServer.Core;
 using RedisServer.Persistence;
+using RedisServer.Replication;
 
 namespace RedisServer.Options;
 
@@ -26,6 +27,15 @@ namespace RedisServer.Options;
 /// <item><c>--maxmemory-policy &lt;name&gt;</c> — eviction policy at the ceiling: noeviction (default),
 /// allkeys-lru, allkeys-random, volatile-lru, volatile-random, volatile-ttl (the LFU family is not
 /// implemented and is refused at startup)</item>
+/// <item><c>--replicaof &lt;host&gt; &lt;port&gt;</c> — start as a replica of the given primary
+/// (default: standalone primary). The REPLICAOF command changes the target — or promotes with
+/// NO ONE — at runtime</item>
+/// <item><c>--masterauth &lt;password&gt;</c> — the password this server presents with AUTH when
+/// connecting to its primary as a replica (default: none; the <c>REDIS_MASTERAUTH</c> environment
+/// variable is the fallback)</item>
+/// <item><c>--repl-backlog-size &lt;bytes&gt;</c> — bound of the replication backlog ring, and of
+/// each replica link's outbound queue (default 16mb). Accepts the same size suffixes as
+/// <c>--maxmemory</c></item>
 /// </list>
 /// </summary>
 public sealed class ServerOptions
@@ -61,6 +71,18 @@ public sealed class ServerOptions
 
     /// <summary>Eviction policy applied when the dataset is over <see cref="MaxMemory"/>.</summary>
     public MaxMemoryPolicy MaxMemoryPolicy { get; init; } = MaxMemoryPolicy.NoEviction;
+
+    /// <summary>Startup replication target (the REPLICAOF command can change it later); null = primary.</summary>
+    public string? ReplicaOfHost { get; init; }
+
+    /// <summary>Port of <see cref="ReplicaOfHost"/>; meaningful only when a host is set.</summary>
+    public int ReplicaOfPort { get; init; }
+
+    /// <summary>Password presented to the primary when connecting as a replica, or null.</summary>
+    public string? MasterAuth { get; init; }
+
+    /// <summary>Replication backlog bound in bytes; also each replica link's outbound queue bound.</summary>
+    public long ReplBacklogSizeBytes { get; init; } = ReplicationManager.DefaultBacklogSizeBytes;
 
     /// <summary>
     /// Redis's human size grammar: an optional suffix scales the number —
@@ -107,6 +129,10 @@ public sealed class ServerOptions
         var requirePass = Environment.GetEnvironmentVariable("REDIS_REQUIREPASS");
         var maxMemory = 0L;
         var maxMemoryPolicy = MaxMemoryPolicy.NoEviction;
+        var replicaOfHost = (string?)null;
+        var replicaOfPort = 0;
+        var masterAuth = Environment.GetEnvironmentVariable("REDIS_MASTERAUTH");
+        var replBacklogSizeBytes = ReplicationManager.DefaultBacklogSizeBytes;
         var tlsPort = 0;
         var tlsCertFile = (string?)null;
         var tlsCertPassword = Environment.GetEnvironmentVariable("REDIS_TLS_CERT_PASSWORD");
@@ -140,6 +166,23 @@ public sealed class ServerOptions
                 case "--maxmemory-policy":
                     maxMemoryPolicy = ParseMaxMemoryPolicy(value);
                     break;
+                case "--replicaof":
+                    // Two values (host, port): the port is the argument
+                    // after the host. The pair loop later visits both as
+                    // candidate flags; neither matches a case, so they are
+                    // simply skipped there.
+                    if (i + 2 >= args.Length || !int.TryParse(args[i + 2], out var parsedReplicaPort) ||
+                        parsedReplicaPort is < 1 or > 65535)
+                        throw new ArgumentException("--replicaof requires a host and a port between 1 and 65535.");
+                    replicaOfHost = value;
+                    replicaOfPort = parsedReplicaPort;
+                    break;
+                case "--masterauth":
+                    masterAuth = value;
+                    break;
+                case "--repl-backlog-size":
+                    replBacklogSizeBytes = ParseMemorySize(value);
+                    break;
                 case "--tls-port" when int.TryParse(value, out var parsedTlsPort):
                     tlsPort = parsedTlsPort;
                     break;
@@ -171,6 +214,10 @@ public sealed class ServerOptions
             RequirePass = string.IsNullOrEmpty(requirePass) ? null : requirePass,
             MaxMemory = maxMemory,
             MaxMemoryPolicy = maxMemoryPolicy,
+            ReplicaOfHost = replicaOfHost,
+            ReplicaOfPort = replicaOfPort,
+            MasterAuth = string.IsNullOrEmpty(masterAuth) ? null : masterAuth,
+            ReplBacklogSizeBytes = replBacklogSizeBytes,
             TlsPort = tlsPort,
             TlsCertFile = tlsCertFile,
             TlsCertPassword = tlsCertPassword

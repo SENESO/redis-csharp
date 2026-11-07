@@ -3,6 +3,7 @@ using RedisServer.Hosting;
 using RedisServer.Options;
 using RedisServer.Persistence;
 using RedisServer.Protocol;
+using RedisServer.Replication;
 using RedisServer.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -21,6 +22,8 @@ builder.Services.AddSingleton(sp => new RedisStore(
     sp.GetRequiredService<RedisStats>()));
 builder.Services.AddSingleton<PersistenceManager>();
 builder.Services.AddSingleton<PubSubHub>();
+builder.Services.AddSingleton(sp => new ReplicationManager(
+    options.ReplBacklogSizeBytes, options.ReplicaOfHost, options.ReplicaOfPort));
 builder.Services.AddSingleton(sp => new CommandProcessor(
     sp.GetRequiredService<RedisStore>(),
     sp.GetRequiredService<RedisStats>(),
@@ -31,10 +34,12 @@ builder.Services.AddSingleton(sp => new CommandProcessor(
     options.RequirePass,
     options.TlsPort,
     options.MaxMemory,
-    options.MaxMemoryPolicy));
+    options.MaxMemoryPolicy,
+    sp.GetRequiredService<ReplicationManager>()));
 builder.Services.AddSingleton<TcpServer>();
 builder.Services.AddHostedService<RedisHostedService>();
 builder.Services.AddHostedService<MaintenanceService>();
+builder.Services.AddHostedService<ReplicationService>();
 
 var host = builder.Build();
 await host.RunAsync();

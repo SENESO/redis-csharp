@@ -64,6 +64,29 @@ public sealed class ClientContext
     /// <summary>Session-provided push channel for pub/sub frames (already RESP-encoded). Invoked from any thread.</summary>
     public Action<byte[]>? PostFrame { get; set; }
 
+    /// <summary>
+    /// True once this connection has been claimed by a PSYNC: it is a
+    /// replication link, not a client. The processor drops every further
+    /// command on it silently — any reply bytes would corrupt the
+    /// replication stream the replica is parsing.
+    /// </summary>
+    public bool IsReplicationLink { get; set; }
+
+    /// <summary>
+    /// Session-provided hard close: completes the transport so the
+    /// session ends promptly. A replica link whose outbound queue
+    /// overflows invokes this (a stalled replica must be dropped, not
+    /// waited on). Set by the session alongside <see cref="PostFrame"/>.
+    /// </summary>
+    public Action? ForceClose { get; set; }
+
+    /// <summary>
+    /// Invoked by the session as it tears the connection down, whatever
+    /// the reason. The PSYNC handler uses it to unregister the replica
+    /// link so INFO's connected_slaves and the fan-out set stay exact.
+    /// </summary>
+    public Action? Disconnected { get; set; }
+
     public long SubscriptionCount => Channels.Count + Patterns.Count;
 
     public bool IsSubscribed => SubscriptionCount > 0;

@@ -61,4 +61,38 @@ public sealed class AofStreamingTests
         Assert.Equal(0, delivered);
         Assert.False(truncated);
     }
+
+    [Fact]
+    public void StreamCommands_WhileTheWriterStillHoldsTheFileOpen()
+    {
+        // Startup loads the AOF through StreamCommands on a PersistenceManager
+        // whose writer stream already holds the file open. On Windows a
+        // reader whose share mode does not permit the writer's write access
+        // is refused with a sharing-violation IOException (POSIX ignores
+        // share modes, so this passed on Linux even while broken). The
+        // reader must open with FileShare.ReadWrite | FileShare.Delete.
+        var dir = Path.Combine(Path.GetTempPath(), "redis-csharp-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "appendonly.aof");
+
+        using var writer = new AppendOnlyFile(path, AofFsyncPolicy.Always);
+        writer.Append(new[]
+        {
+            System.Text.Encoding.ASCII.GetBytes("SET"),
+            System.Text.Encoding.ASCII.GetBytes("a"),
+            System.Text.Encoding.ASCII.GetBytes("1")
+        });
+        writer.Append(new[]
+        {
+            System.Text.Encoding.ASCII.GetBytes("INCR"),
+            System.Text.Encoding.ASCII.GetBytes("n")
+        });
+
+        // The writer is deliberately still open here.
+        var commands = AppendOnlyFile.ReadCommands(path, out var truncated);
+        Assert.False(truncated);
+        Assert.Equal(2, commands.Count);
+        Assert.Equal("SET", System.Text.Encoding.ASCII.GetString(commands[0][0]));
+        Assert.Equal("INCR", System.Text.Encoding.ASCII.GetString(commands[1][0]));
+    }
 }

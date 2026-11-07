@@ -37,7 +37,13 @@ public static class SnapshotFile
     private const uint FormatVersion = 1;
     private const byte EndMarker = 0xFF;
 
-    public static void Write(string path, IReadOnlyList<ExportedEntry> entries)
+    /// <summary>
+    /// Serialises entries to the exact bytes <see cref="Write"/> puts on
+    /// disk (payload + CRC trailer). Replication's full sync ships these
+    /// bytes verbatim, so a replica's snapshot load is the same code path
+    /// as a file load (<see cref="TryParse"/>).
+    /// </summary>
+    public static byte[] Serialize(IReadOnlyList<ExportedEntry> entries)
     {
         using var buffer = new MemoryStream();
         using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
@@ -51,13 +57,19 @@ public static class SnapshotFile
 
         var payload = buffer.ToArray();
         var crc = Crc32.Compute(payload);
+        var bytes = new byte[payload.Length + 4];
+        payload.CopyTo(bytes, 0);
+        BitConverter.GetBytes(crc).CopyTo(bytes, payload.Length);
+        return bytes;
+    }
 
+    public static void Write(string path, IReadOnlyList<ExportedEntry> entries)
+    {
+        var bytes = Serialize(entries);
         var tempPath = path + ".tmp";
         using (var file = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
         {
-            file.Write(payload);
-            var crcBytes = BitConverter.GetBytes(crc);
-            file.Write(crcBytes);
+            file.Write(bytes);
             file.Flush(flushToDisk: true);
         }
         File.Move(tempPath, path, overwrite: true);
@@ -121,13 +133,35 @@ public static class SnapshotFile
         byte[] all;
         try
         {
-            all = File.ReadAllBytes(path);
+            // ReadWrite | Delete sharing, for the same Windows reason as
+            // the AOF reader: File.ReadAllBytes shares for read only,
+            // which both fails against a handle holding the file open and
+            // blocks the atomic move-overwrite that replaces a snapshot.
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var copy = new MemoryStream();
+            stream.CopyTo(copy);
+            all = copy.ToArray();
         }
         catch (Exception ex)
         {
             error = $"could not read the file: {ex.Message}";
             return SnapshotLoadStatus.Corrupt;
         }
+
+        return TryParse(all, out entries, out error);
+    }
+
+    /// <summary>
+    /// Validates and parses snapshot bytes (the form <see cref="Serialize"/>
+    /// produces and <see cref="TryRead"/> loads from disk). Replication's
+    /// full sync parses the bytes it received over the wire through here,
+    /// so a damaged stream is rejected exactly like a damaged file.
+    /// </summary>
+    public static SnapshotLoadStatus TryParse(byte[] all, out IReadOnlyList<ExportedEntry> entries, out string? error)
+    {
+        entries = Array.Empty<ExportedEntry>();
+        error = null;
 
         // Smallest legal file: header (8) + end marker (1) + CRC (4).
         if (all.Length < 13)

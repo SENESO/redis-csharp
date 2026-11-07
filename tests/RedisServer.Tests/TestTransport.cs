@@ -5,6 +5,7 @@ using RedisServer.Core;
 using RedisServer.Options;
 using RedisServer.Persistence;
 using RedisServer.Protocol;
+using RedisServer.Replication;
 
 namespace RedisServer.Tests;
 
@@ -70,6 +71,60 @@ internal sealed class TestClient
             }
         }
         _received.RemoveRange(0, expectedBytes.Length);
+    }
+
+    /// <summary>Reads one CRLF-terminated line, returned without the CRLF (replication-stream headers).</summary>
+    public async Task<string> ReadLineAsync(int timeoutMs = 5000)
+    {
+        using var timeout = new CancellationTokenSource(timeoutMs);
+        while (true)
+        {
+            for (var i = 0; i + 1 < _received.Count; i++)
+            {
+                if (_received[i] == (byte)'\r' && _received[i + 1] == (byte)'\n')
+                {
+                    var line = Encoding.ASCII.GetString(_received.GetRange(0, i).ToArray());
+                    _received.RemoveRange(0, i + 2);
+                    return line;
+                }
+            }
+            if (_closed)
+                throw new Xunit.Sdk.XunitException(
+                    $"The session closed before a full line arrived; received: \"{Escape(CurrentText())}\".");
+            try
+            {
+                await FillAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                throw new Xunit.Sdk.XunitException(
+                    $"Timed out waiting for a line; received so far: \"{Escape(CurrentText())}\".");
+            }
+        }
+    }
+
+    /// <summary>Reads exactly <paramref name="count"/> raw bytes (a replication snapshot payload).</summary>
+    public async Task<byte[]> ReadBytesAsync(int count, int timeoutMs = 10000)
+    {
+        using var timeout = new CancellationTokenSource(timeoutMs);
+        while (_received.Count < count)
+        {
+            if (_closed)
+                throw new Xunit.Sdk.XunitException(
+                    $"The session closed with {_received.Count} of {count} bytes received.");
+            try
+            {
+                await FillAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                throw new Xunit.Sdk.XunitException(
+                    $"Timed out waiting for {count} bytes; received {_received.Count}.");
+            }
+        }
+        var bytes = _received.GetRange(0, count).ToArray();
+        _received.RemoveRange(0, count);
+        return bytes;
     }
 
     /// <summary>An error reply, distinguished from a simple-string reply.</summary>
@@ -320,7 +375,8 @@ internal sealed class SessionHarness : IAsyncDisposable
     private readonly string _dataDirectory;
 
     private SessionHarness(RedisStore store, RedisStats stats, FakeTimeProvider clock,
-        CommandProcessor processor, PubSubHub hub, PersistenceManager persistence, string dataDirectory)
+        CommandProcessor processor, PubSubHub hub, PersistenceManager persistence,
+        ReplicationManager replication, string dataDirectory)
     {
         Store = store;
         Stats = stats;
@@ -328,6 +384,7 @@ internal sealed class SessionHarness : IAsyncDisposable
         Processor = processor;
         Hub = hub;
         Persistence = persistence;
+        Replication = replication;
         _dataDirectory = dataDirectory;
     }
 
@@ -337,10 +394,12 @@ internal sealed class SessionHarness : IAsyncDisposable
     public CommandProcessor Processor { get; }
     public PubSubHub Hub { get; }
     public PersistenceManager Persistence { get; }
+    public ReplicationManager Replication { get; }
     public string DataDirectory => _dataDirectory;
 
     public static SessionHarness Start(bool appendOnly = false, string? requirePass = null,
-        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction)
+        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction,
+        long replBacklogSizeBytes = ReplicationManager.DefaultBacklogSizeBytes)
     {
         var clock = new FakeTimeProvider();
         var stats = new RedisStats();
@@ -355,9 +414,11 @@ internal sealed class SessionHarness : IAsyncDisposable
         };
         var persistence = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
         var hub = new PubSubHub();
+        var replication = new ReplicationManager(replBacklogSizeBytes);
         var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0,
-            requirePass: requirePass, maxMemory: maxMemory, maxMemoryPolicy: maxMemoryPolicy);
-        return new SessionHarness(store, stats, clock, processor, hub, persistence, directory);
+            requirePass: requirePass, maxMemory: maxMemory, maxMemoryPolicy: maxMemoryPolicy,
+            replication: replication);
+        return new SessionHarness(store, stats, clock, processor, hub, persistence, replication, directory);
     }
 
     /// <summary>Opens one more client connection against the shared server core.</summary>

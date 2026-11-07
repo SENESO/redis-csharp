@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text;
 using RedisServer.Core;
 using RedisServer.Persistence;
+using RedisServer.Replication;
 
 namespace RedisServer.Protocol;
 
@@ -36,6 +37,7 @@ public sealed partial class CommandProcessor
     private readonly TimeProvider _clock;
     private readonly PersistenceManager _persistence;
     private readonly PubSubHub _hub;
+    private readonly ReplicationManager _replication;
     private readonly int _port;
     private readonly int _tlsPort;
     private readonly byte[]? _requirePass;
@@ -47,20 +49,22 @@ public sealed partial class CommandProcessor
 
     private delegate void CommandHandler(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects);
 
-    private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler, bool DenyOom = false);
+    private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler, bool DenyOom = false, bool Write = false);
 
     private readonly long _maxMemory;
     private readonly MaxMemoryPolicy _maxMemoryPolicy;
 
     public CommandProcessor(RedisStore store, RedisStats stats, TimeProvider clock,
         PersistenceManager persistence, PubSubHub hub, int port, string? requirePass = null, int tlsPort = 0,
-        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction)
+        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction,
+        ReplicationManager? replication = null)
     {
         _store = store;
         _stats = stats;
         _clock = clock;
         _persistence = persistence;
         _hub = hub;
+        _replication = replication ?? new ReplicationManager(ReplicationManager.DefaultBacklogSizeBytes);
         _port = port;
         _tlsPort = tlsPort;
         _requirePass = requirePass is null ? null : Encoding.UTF8.GetBytes(requirePass);
@@ -70,14 +74,17 @@ public sealed partial class CommandProcessor
         _specs = BuildSpecs();
     }
 
+    /// <summary>The replication state machine this processor serves and enforces.</summary>
+    public ReplicationManager Replication => _replication;
+
     private Dictionary<byte[], CommandSpec> BuildSpecs()
     {
         // Dispatch is by the raw name bytes under an ASCII case-insensitive
         // comparison, so the hot path never materialises the name as a
         // string; names are only stringified on error paths.
         var specs = new Dictionary<byte[], CommandSpec>(AsciiNameComparer.Instance);
-        void Add(string name, int min, int max, CommandHandler handler, bool pubsub = false, bool denyOom = false) =>
-            specs[Ascii(name)] = new CommandSpec(min, max, pubsub, handler, denyOom);
+        void Add(string name, int min, int max, CommandHandler handler, bool pubsub = false, bool denyOom = false, bool write = false) =>
+            specs[Ascii(name)] = new CommandSpec(min, max, pubsub, handler, denyOom, write);
 
         // Connection / server
         Add("PING", 1, 2, Ping, pubsub: true);
@@ -88,59 +95,70 @@ public sealed partial class CommandProcessor
         Add("QUIT", 1, 1, Quit, pubsub: true);
         Add("DBSIZE", 1, 1, DbSize);
         Add("INFO", 1, 2, Info);
-        Add("FLUSHDB", 1, 2, FlushDb);
-        Add("FLUSHALL", 1, 2, FlushDb);
+        Add("FLUSHDB", 1, 2, FlushDb, write: true);
+        Add("FLUSHALL", 1, 2, FlushDb, write: true);
         Add("SAVE", 1, 1, Save);
         Add("BGSAVE", 1, 1, BgSave);
         Add("BGREWRITEAOF", 1, 1, BgRewriteAof);
 
+        // Replication. The Write flag on every spec is the read/write
+        // classification read-only enforcement consults on a replica; it
+        // is deliberately NOT the DenyOom set — that one answers "may
+        // this allocate against a full memory ceiling", a different
+        // question (LPOP allocates nothing yet is a write; SAVE is
+        // refused by neither set's logic but is an admin action, not a
+        // dataset write, and stays available on replicas).
+        Add("REPLICAOF", 3, 3, ReplicaOf);
+        Add("PSYNC", 3, 3, PSync);
+        Add("REPLCONF", 2, -1, ReplConf);
+
         // Strings
-        Add("SET", 3, -1, Set, denyOom: true);
+        Add("SET", 3, -1, Set, denyOom: true, write: true);
         Add("GET", 2, 2, Get);
-        Add("DEL", 2, -1, Del);
+        Add("DEL", 2, -1, Del, write: true);
         Add("EXISTS", 2, -1, Exists);
-        Add("INCR", 2, 2, Incr, denyOom: true);
-        Add("DECR", 2, 2, Decr, denyOom: true);
-        Add("INCRBY", 3, 3, IncrBy, denyOom: true);
-        Add("DECRBY", 3, 3, DecrBy, denyOom: true);
-        Add("APPEND", 3, 3, Append, denyOom: true);
+        Add("INCR", 2, 2, Incr, denyOom: true, write: true);
+        Add("DECR", 2, 2, Decr, denyOom: true, write: true);
+        Add("INCRBY", 3, 3, IncrBy, denyOom: true, write: true);
+        Add("DECRBY", 3, 3, DecrBy, denyOom: true, write: true);
+        Add("APPEND", 3, 3, Append, denyOom: true, write: true);
         Add("STRLEN", 2, 2, StrLen);
 
         // Keys
-        Add("EXPIRE", 3, 4, Expire);
-        Add("PEXPIRE", 3, 4, PExpire);
-        Add("EXPIREAT", 3, 4, ExpireAt);
-        Add("PEXPIREAT", 3, 4, PExpireAt);
+        Add("EXPIRE", 3, 4, Expire, write: true);
+        Add("PEXPIRE", 3, 4, PExpire, write: true);
+        Add("EXPIREAT", 3, 4, ExpireAt, write: true);
+        Add("PEXPIREAT", 3, 4, PExpireAt, write: true);
         Add("TTL", 2, 2, Ttl);
         Add("PTTL", 2, 2, PTtl);
-        Add("PERSIST", 2, 2, Persist);
+        Add("PERSIST", 2, 2, Persist, write: true);
         Add("TYPE", 2, 2, TypeCommand);
         Add("KEYS", 2, 2, Keys);
         Add("SCAN", 2, -1, Scan);
 
         // Collections (CommandProcessorCollections.cs)
-        Add("LPUSH", 3, -1, LeftPush, denyOom: true);
-        Add("RPUSH", 3, -1, RightPush, denyOom: true);
-        Add("LPOP", 2, 3, LeftPop);
-        Add("RPOP", 2, 3, RightPop);
+        Add("LPUSH", 3, -1, LeftPush, denyOom: true, write: true);
+        Add("RPUSH", 3, -1, RightPush, denyOom: true, write: true);
+        Add("LPOP", 2, 3, LeftPop, write: true);
+        Add("RPOP", 2, 3, RightPop, write: true);
         Add("LLEN", 2, 2, ListLength);
         Add("LRANGE", 4, 4, ListRange);
         Add("LINDEX", 3, 3, ListIndex);
-        Add("SADD", 3, -1, SetAdd, denyOom: true);
-        Add("SREM", 3, -1, SetRemove);
+        Add("SADD", 3, -1, SetAdd, denyOom: true, write: true);
+        Add("SREM", 3, -1, SetRemove, write: true);
         Add("SMEMBERS", 2, 2, SetMembers);
         Add("SISMEMBER", 3, 3, SetIsMember);
         Add("SCARD", 2, 2, SetCard);
-        Add("HSET", 4, -1, HashSet, denyOom: true);
+        Add("HSET", 4, -1, HashSet, denyOom: true, write: true);
         Add("HGET", 3, 3, HashGet);
-        Add("HDEL", 3, -1, HashDelete);
+        Add("HDEL", 3, -1, HashDelete, write: true);
         Add("HGETALL", 2, 2, HashGetAll);
         Add("HLEN", 2, 2, HashLength);
-        Add("ZADD", 4, -1, ZAdd, denyOom: true);
-        Add("ZINCRBY", 4, 4, ZIncrBy, denyOom: true);
+        Add("ZADD", 4, -1, ZAdd, denyOom: true, write: true);
+        Add("ZINCRBY", 4, 4, ZIncrBy, denyOom: true, write: true);
         Add("ZSCORE", 3, 3, ZScore);
         Add("ZRANGE", 4, 5, ZRange);
-        Add("ZREM", 3, -1, ZRemove);
+        Add("ZREM", 3, -1, ZRemove, write: true);
         Add("ZCARD", 2, 2, ZCard);
 
         // Transactions are intercepted before dispatch (see ExecuteLocked);
@@ -189,6 +207,7 @@ public sealed partial class CommandProcessor
                 if (effects.Count > 0)
                 {
                     _persistence.AppendEffects(effects);
+                    RecordLocalEffects(effects);
                     effects.Clear();
                 }
                 if (ctx.CloseRequested)
@@ -215,6 +234,68 @@ public sealed partial class CommandProcessor
         }
     }
 
+    /// <summary>
+    /// Feeds one executed command's normalised effects into the
+    /// replication stream: each effect is encoded once and appended to
+    /// the served stream (backlog + replica fan-out) in execution order.
+    /// The encoding is the AOF's, so the replication stream and the AOF
+    /// are byte-for-byte the same history.
+    /// </summary>
+    private void RecordLocalEffects(List<byte[][]> effects)
+    {
+        foreach (var effect in effects)
+            _replication.AppendServedFrame(RespWriter.EncodeCommand(effect));
+    }
+
+    /// <summary>
+    /// Applies one propagated frame on a replica: executes it with a
+    /// server-internal context (no reply stream, no read-only or memory
+    /// refusal — the primary already admitted the write), then records
+    /// the frame itself — it is already a normalised effect — in this
+    /// server's AOF and served stream. Returns false when the frame
+    /// errored (a stream that disagrees with the primary's history;
+    /// nothing is recorded for it, so offsets never claim it applied).
+    /// </summary>
+    public bool ApplyReplicationFrame(byte[][] args, byte[] rawFrame)
+    {
+        var ctx = new ClientContext { IsAuthenticated = true, IsServerInternal = true };
+        var sink = new ArrayBufferWriter<byte>();
+        lock (_gate)
+        {
+            var before = sink.WrittenCount;
+            ExecuteLocked(args, ctx, sink, new List<byte[][]>(), inTransactionBody: false);
+            var errored = sink.WrittenCount > before && sink.WrittenSpan[0] == (byte)'-';
+            if (errored)
+                return false;
+            _persistence.AppendEffects(new[] { args });
+            _replication.NoteAppliedFrame(rawFrame);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Replaces the whole keyspace with a snapshot received during a full
+    /// sync. The snapshot load and the AOF reset happen under the command
+    /// gate, so no client read can observe a half-loaded state: after a
+    /// full sync the replica's AOF is rewritten from the synced state
+    /// (the pre-sync history belongs to a dataset that no longer exists),
+    /// and subsequent propagated frames append onto it.
+    /// </summary>
+    public void LoadReplicationSnapshot(byte[] snapshotBytes)
+    {
+        var status = SnapshotFile.TryParse(snapshotBytes, out var entries, out var error);
+        if (status != SnapshotLoadStatus.Loaded)
+            throw new InvalidDataException($"Replication snapshot is unusable: {error}");
+        lock (_gate)
+        {
+            _store.FlushAll();
+            foreach (var entry in entries)
+                _store.ImportEntry(entry);
+            if (_persistence.AofEnabled)
+                _persistence.RewriteAof(_store);
+        }
+    }
+
     private void ExecuteLocked(byte[][] args, ClientContext ctx, IBufferWriter<byte> output,
         List<byte[][]> effects, bool inTransactionBody)
     {
@@ -224,6 +305,13 @@ public sealed partial class CommandProcessor
             RespWriter.WriteError(output, "ERR empty command");
             return;
         }
+
+        // A replication link speaks only the replication stream. Anything
+        // the replica side sends after PSYNC (REPLCONF bookkeeping, a
+        // stray PING) is dropped without a reply: reply bytes would be
+        // parsed as propagation frames by the replica and corrupt it.
+        if (ctx.IsReplicationLink)
+            return;
 
         var rawName = args[0];
 
@@ -298,6 +386,19 @@ public sealed partial class CommandProcessor
         if (args.Length < spec.MinArgs || (spec.MaxArgs >= 0 && args.Length > spec.MaxArgs))
         {
             RespWriter.WriteError(output, ArityError(NameOf(rawName)));
+            return;
+        }
+
+        // Read-only replica enforcement, at the point of actual dispatch
+        // (so commands queued in a MULTI are judged when EXEC runs them,
+        // and their READONLY errors land inside the EXEC array, as in
+        // Redis). The classification is the spec's Write flag — the true
+        // write set, not the maxmemory deny-OOM set. Server-internal
+        // execution (AOF replay, replication apply) is not a client and
+        // is never refused.
+        if (_replication.IsReplica && !ctx.IsServerInternal && spec.Write)
+        {
+            RespWriter.WriteError(output, "READONLY You can't write against a read only replica.");
             return;
         }
 
@@ -697,7 +798,7 @@ public sealed partial class CommandProcessor
         RespWriter.WriteBulkString(output, "id");
         RespWriter.WriteInteger(output, ctx.Id);
         WriteHelloPair(output, "mode", "standalone");
-        WriteHelloPair(output, "role", "master");
+        WriteHelloPair(output, "role", _replication.IsReplica ? "slave" : "master");
         RespWriter.WriteBulkString(output, "modules");
         RespWriter.WriteArrayHeader(output, 0);
     }
@@ -796,6 +897,30 @@ public sealed partial class CommandProcessor
             builder.Append("pubsub_channels:").Append(_hub.ChannelCount).Append("\r\n");
             builder.Append("pubsub_patterns:").Append(_hub.PatternCount).Append("\r\n");
         });
+        Section("Replication", () =>
+        {
+            if (_replication.IsReplica)
+            {
+                builder.Append("role:slave\r\n");
+                var target = _replication.FollowTarget;
+                builder.Append("master_host:").Append(target?.Host ?? string.Empty).Append("\r\n");
+                builder.Append("master_port:").Append(target?.Port ?? 0).Append("\r\n");
+                builder.Append("master_link_status:").Append(_replication.MasterLinkUp ? "up" : "down").Append("\r\n");
+                builder.Append("master_sync_in_progress:").Append(_replication.SyncInProgress ? 1 : 0).Append("\r\n");
+                builder.Append("master_repl_offset:").Append(_replication.FollowOffset).Append("\r\n");
+            }
+            else
+            {
+                builder.Append("role:master\r\n");
+                builder.Append("master_repl_offset:").Append(_replication.Offset).Append("\r\n");
+            }
+            builder.Append("connected_slaves:").Append(_replication.ConnectedReplicas).Append("\r\n");
+            builder.Append("master_replid:").Append(_replication.ReplId).Append("\r\n");
+            builder.Append("repl_backlog_active:1\r\n");
+            builder.Append("repl_backlog_size:").Append(_replication.BacklogSizeBytes).Append("\r\n");
+            builder.Append("repl_backlog_first_byte_offset:").Append(_replication.BacklogFirstByteOffset).Append("\r\n");
+            builder.Append("repl_backlog_histlen:").Append(_replication.BacklogHistoryLength).Append("\r\n");
+        });
         Section("Keyspace", () =>
         {
             builder.Append("db0:keys=").Append(_store.Count)
@@ -885,6 +1010,104 @@ public sealed partial class CommandProcessor
         // file. (Real Redis forks instead; see the README's design notes.)
         _persistence.RewriteAof(_store);
         RespWriter.WriteSimpleString(output, "Background append only file rewriting started");
+    }
+
+    // ------------------------------------------------------------------
+    // Replication commands
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// REPLCONF ...: replica bookkeeping (listening-port, capabilities,
+    /// acknowledgements). Accepted and otherwise ignored — progress here
+    /// is tracked by stream position, not by replica acknowledgements.
+    /// </summary>
+    private void ReplConf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
+        RespWriter.WriteSimpleString(output, "OK");
+
+    /// <summary>
+    /// REPLICAOF host port | REPLICAOF NO ONE. The role change takes
+    /// effect immediately for read-only enforcement and INFO; the
+    /// replication service observes the state change and connects,
+    /// reconnects, or stops by itself. The dataset is left untouched by
+    /// the switch: an incoming full sync replaces it wholesale.
+    /// </summary>
+    private void ReplicaOf(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        if (IsName(args[1], "NO") && IsName(args[2], "ONE"))
+        {
+            _replication.Promote();
+            RespWriter.WriteSimpleString(output, "OK");
+            return;
+        }
+
+        var host = Encoding.UTF8.GetString(args[1]);
+        if (!long.TryParse(RespParser.Describe(args[2]), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var port) || port is < 1 or > 65535)
+            throw new RedisCommandException("ERR Invalid port");
+        if (port == _port && host is "127.0.0.1" or "localhost" or "::1")
+            throw new RedisCommandException("ERR Can't replicate from itself.");
+        _replication.SetReplicaOf(host, (int)port);
+        RespWriter.WriteSimpleString(output, "OK");
+    }
+
+    /// <summary>
+    /// PSYNC replid offset: claims this connection as a replication link.
+    /// It runs under the command gate, so the decision, the snapshot and
+    /// the link registration are atomic against client writes: a full
+    /// sync's snapshot is the state at exactly the advertised offset, and
+    /// every effect after it reaches the link through its bounded outbox,
+    /// in order. Nothing is written to the normal reply buffer — the sync
+    /// header (and snapshot) go out as one pushed frame, ahead of the
+    /// link pump's frames, so they are the first bytes the replica reads.
+    ///
+    /// The full-sync wire form mirrors Redis's RDB transfer: a
+    /// +FULLRESYNC line, then a bulk-string header and the raw snapshot
+    /// bytes with NO trailing CRLF.
+    /// </summary>
+    private void PSync(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        if (ctx.PostFrame is null)
+        {
+            RespWriter.WriteError(output, "ERR PSYNC is only available on a framed connection");
+            return;
+        }
+
+        var requestedId = RespParser.Describe(args[1]);
+        if (!long.TryParse(RespParser.Describe(args[2]), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var requestedOffset))
+            requestedOffset = -1;
+
+        var kind = _replication.DecideSync(requestedId, requestedOffset, out var slice);
+        byte[] header;
+        if (kind == SyncKind.Full)
+        {
+            var snapshot = SnapshotFile.Serialize(_store.ExportState());
+            var head = Encoding.ASCII.GetBytes(
+                $"+FULLRESYNC {_replication.ReplId} {_replication.Offset}\r\n${snapshot.Length}\r\n");
+            header = new byte[head.Length + snapshot.Length];
+            head.CopyTo(header, 0);
+            snapshot.CopyTo(header, head.Length);
+        }
+        else
+        {
+            header = "+CONTINUE\r\n"u8.ToArray();
+        }
+
+        var postFrame = ctx.PostFrame;
+        var link = _replication.RegisterLink(postFrame, ctx.ForceClose);
+        ctx.IsReplicationLink = true;
+        ctx.Disconnected = () =>
+        {
+            _replication.UnregisterLink(link);
+            link.Close();
+        };
+        postFrame(header);
+        if (slice is not null)
+        {
+            foreach (var frame in slice)
+                link.Enqueue(frame);
+        }
+        link.StartLive();
     }
 
     // ------------------------------------------------------------------

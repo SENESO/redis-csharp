@@ -122,8 +122,14 @@ public sealed class AppendOnlyFile : IDisposable
             return 0;
 
         long delivered = 0;
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: 64 * 1024);
+        // The share mode must tolerate the live AOF writer: on Windows a
+        // reader opened with FileShare.Read alone is refused outright,
+        // because its share mode does not permit the writer's existing
+        // write access (POSIX ignores share modes, so Linux never notices).
+        // Delete sharing also lets an AOF rewrite swap the file while a
+        // reader still holds it open.
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, bufferSize: 64 * 1024);
         var reader = System.IO.Pipelines.PipeReader.Create(stream);
         try
         {

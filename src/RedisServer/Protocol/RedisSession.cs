@@ -39,6 +39,13 @@ public sealed class RedisSession
         _logger = logger ?? NullLogger.Instance;
         _context.Id = Interlocked.Increment(ref _nextConnectionId);
         _context.PostFrame = frame => _outbound.Writer.TryWrite(frame);
+        _context.ForceClose = () =>
+        {
+            // Completing both pipe ends wakes the read loop and the output
+            // pump; the session then runs its normal teardown.
+            _transport.Input.Complete();
+            _transport.Output.Complete();
+        };
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -59,6 +66,15 @@ public sealed class RedisSession
         finally
         {
             _hub.RemoveAll(_context);
+            try
+            {
+                _context.Disconnected?.Invoke();
+            }
+            catch (Exception)
+            {
+                // Cleanup hooks (replica-link unregister) must never throw
+                // into session teardown.
+            }
             _outbound.Writer.TryComplete();
             try
             {
