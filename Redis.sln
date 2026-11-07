@@ -1,0 +1,45 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{8926517E-C97B-4FA6-B305-BA9F2E27323F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RedisServer", "src\RedisServer\RedisServer.csproj", "{FDA9E59F-132C-4EE2-9245-7A534793CCB5}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{2A646BDE-676E-4D96-8BEA-180620E712FB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RedisServer.Tests", "tests\RedisServer.Tests\RedisServer.Tests.csproj", "{90BA02CC-E0AE-4E12-97A2-C4B08ED68937}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{8C673C08-E21F-466B-B23A-2BAD84678A00}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RedisBenchmark", "tools\RedisBenchmark\RedisBenchmark.csproj", "{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FDA9E59F-132C-4EE2-9245-7A534793CCB5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FDA9E59F-132C-4EE2-9245-7A534793CCB5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FDA9E59F-132C-4EE2-9245-7A534793CCB5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FDA9E59F-132C-4EE2-9245-7A534793CCB5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{90BA02CC-E0AE-4E12-97A2-C4B08ED68937}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{90BA02CC-E0AE-4E12-97A2-C4B08ED68937}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{90BA02CC-E0AE-4E12-97A2-C4B08ED68937}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{90BA02CC-E0AE-4E12-97A2-C4B08ED68937}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{FDA9E59F-132C-4EE2-9245-7A534793CCB5} = {8926517E-C97B-4FA6-B305-BA9F2E27323F}
+		{90BA02CC-E0AE-4E12-97A2-C4B08ED68937} = {2A646BDE-676E-4D96-8BEA-180620E712FB}
+		{A328AD7D-255E-42B3-9602-2F7A5BCE8DBF} = {8C673C08-E21F-466B-B23A-2BAD84678A00}
+	EndGlobalSection
+EndGlobal
