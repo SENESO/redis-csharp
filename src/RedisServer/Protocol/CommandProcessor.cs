@@ -37,18 +37,20 @@ public sealed partial class CommandProcessor
     private readonly PersistenceManager _persistence;
     private readonly PubSubHub _hub;
     private readonly int _port;
+    private readonly int _tlsPort;
+    private readonly byte[]? _requirePass;
     private readonly DateTimeOffset _startedAt;
     private readonly object _gate = new();
     private int _backgroundSaveRunning;
 
-    private readonly Dictionary<string, CommandSpec> _specs;
+    private readonly Dictionary<byte[], CommandSpec> _specs;
 
     private delegate void CommandHandler(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects);
 
     private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler);
 
     public CommandProcessor(RedisStore store, RedisStats stats, TimeProvider clock,
-        PersistenceManager persistence, PubSubHub hub, int port)
+        PersistenceManager persistence, PubSubHub hub, int port, string? requirePass = null, int tlsPort = 0)
     {
         _store = store;
         _stats = stats;
@@ -56,19 +58,25 @@ public sealed partial class CommandProcessor
         _persistence = persistence;
         _hub = hub;
         _port = port;
+        _tlsPort = tlsPort;
+        _requirePass = requirePass is null ? null : Encoding.UTF8.GetBytes(requirePass);
         _startedAt = clock.GetUtcNow();
         _specs = BuildSpecs();
     }
 
-    private Dictionary<string, CommandSpec> BuildSpecs()
+    private Dictionary<byte[], CommandSpec> BuildSpecs()
     {
-        var specs = new Dictionary<string, CommandSpec>(StringComparer.Ordinal);
+        // Dispatch is by the raw name bytes under an ASCII case-insensitive
+        // comparison, so the hot path never materialises the name as a
+        // string; names are only stringified on error paths.
+        var specs = new Dictionary<byte[], CommandSpec>(AsciiNameComparer.Instance);
         void Add(string name, int min, int max, CommandHandler handler, bool pubsub = false) =>
-            specs[name] = new CommandSpec(min, max, pubsub, handler);
+            specs[Ascii(name)] = new CommandSpec(min, max, pubsub, handler);
 
         // Connection / server
         Add("PING", 1, 2, Ping, pubsub: true);
         Add("ECHO", 2, 2, Echo);
+        Add("AUTH", 2, 3, Auth);
         Add("QUIT", 1, 1, Quit, pubsub: true);
         Add("DBSIZE", 1, 1, DbSize);
         Add("INFO", 1, 2, Info);
@@ -150,14 +158,33 @@ public sealed partial class CommandProcessor
     // ------------------------------------------------------------------
 
     /// <summary>Executes one client command, writing its reply to <paramref name="output"/>.</summary>
-    public void Execute(byte[][] args, ClientContext ctx, IBufferWriter<byte> output)
+    public void Execute(byte[][] args, ClientContext ctx, IBufferWriter<byte> output) =>
+        ExecuteBatch(new[] { args }, ctx, output);
+
+    /// <summary>
+    /// Executes a batch of commands parsed from one read under a single
+    /// gate acquisition, so a pipelined batch pays the serialisation cost
+    /// once instead of once per command. Per-command semantics are exactly
+    /// those of <see cref="Execute"/>: each command's AOF effects are
+    /// appended, in order, before the caller flushes the batch's replies,
+    /// and execution stops after a command that requests close (QUIT).
+    /// </summary>
+    public void ExecuteBatch(IReadOnlyList<byte[][]> commands, ClientContext ctx, IBufferWriter<byte> output)
     {
         lock (_gate)
         {
             var effects = new List<byte[][]>();
-            ExecuteLocked(args, ctx, output, effects, inTransactionBody: false);
-            if (effects.Count > 0)
-                _persistence.AppendEffects(effects);
+            foreach (var args in commands)
+            {
+                ExecuteLocked(args, ctx, output, effects, inTransactionBody: false);
+                if (effects.Count > 0)
+                {
+                    _persistence.AppendEffects(effects);
+                    effects.Clear();
+                }
+                if (ctx.CloseRequested)
+                    break;
+            }
         }
     }
 
@@ -169,7 +196,7 @@ public sealed partial class CommandProcessor
     /// </summary>
     public bool ExecuteReplay(byte[][] args)
     {
-        var ctx = new ClientContext();
+        var ctx = new ClientContext { IsAuthenticated = true };
         var sink = new ArrayBufferWriter<byte>();
         lock (_gate)
         {
@@ -189,12 +216,24 @@ public sealed partial class CommandProcessor
             return;
         }
 
-        var name = NameOf(args[0]);
+        var rawName = args[0];
+
+        // Authentication gate: with a password configured, an
+        // unauthenticated connection may only AUTH or QUIT — every other
+        // command (including MULTI/EXEC and unknown commands) is answered
+        // NOAUTH, exactly as Redis orders it. Transaction bodies are not
+        // re-checked: the EXEC that carries them passed the gate itself.
+        if (!inTransactionBody && _requirePass is not null && !ctx.IsAuthenticated &&
+            !IsName(rawName, "AUTH") && !IsName(rawName, "QUIT"))
+        {
+            RespWriter.WriteError(output, "NOAUTH Authentication required.");
+            return;
+        }
 
         // Transaction control flow.
         if (!inTransactionBody)
         {
-            if (name == "MULTI")
+            if (IsName(rawName, "MULTI"))
             {
                 if (ctx.InTransaction)
                 {
@@ -207,12 +246,12 @@ public sealed partial class CommandProcessor
                 RespWriter.WriteSimpleString(output, "OK");
                 return;
             }
-            if (name == "EXEC")
+            if (IsName(rawName, "EXEC"))
             {
                 ExecuteTransaction(ctx, output, effects);
                 return;
             }
-            if (name == "DISCARD")
+            if (IsName(rawName, "DISCARD"))
             {
                 if (!ctx.InTransaction)
                 {
@@ -227,12 +266,12 @@ public sealed partial class CommandProcessor
             }
             if (ctx.InTransaction)
             {
-                QueueCommand(args, name, ctx, output);
+                QueueCommand(args, ctx, output);
                 return;
             }
         }
 
-        if (!_specs.TryGetValue(name, out var spec))
+        if (!_specs.TryGetValue(rawName, out var spec))
         {
             RespWriter.WriteError(output, $"ERR unknown command '{RespParser.Describe(args[0])}', with args beginning with: {DescribeArgs(args)}");
             return;
@@ -241,13 +280,13 @@ public sealed partial class CommandProcessor
         if (ctx.IsSubscribed && !spec.AllowedInPubSub)
         {
             RespWriter.WriteError(output,
-                $"ERR Can't execute '{name.ToLowerInvariant()}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context");
+                $"ERR Can't execute '{NameOf(rawName).ToLowerInvariant()}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context");
             return;
         }
 
         if (args.Length < spec.MinArgs || (spec.MaxArgs >= 0 && args.Length > spec.MaxArgs))
         {
-            RespWriter.WriteError(output, ArityError(name));
+            RespWriter.WriteError(output, ArityError(NameOf(rawName)));
             return;
         }
 
@@ -269,24 +308,25 @@ public sealed partial class CommandProcessor
         }
     }
 
-    private void QueueCommand(byte[][] args, string name, ClientContext ctx, IBufferWriter<byte> output)
+    private void QueueCommand(byte[][] args, ClientContext ctx, IBufferWriter<byte> output)
     {
-        if (!_specs.TryGetValue(name, out var spec))
+        if (!_specs.TryGetValue(args[0], out var spec))
         {
             ctx.TransactionAborted = true;
             RespWriter.WriteError(output, $"ERR unknown command '{RespParser.Describe(args[0])}', with args beginning with: {DescribeArgs(args)}");
             return;
         }
-        if (name is "SUBSCRIBE" or "PSUBSCRIBE" or "UNSUBSCRIBE" or "PUNSUBSCRIBE" or "PUBLISH")
+        if (IsName(args[0], "SUBSCRIBE") || IsName(args[0], "PSUBSCRIBE") || IsName(args[0], "UNSUBSCRIBE") ||
+            IsName(args[0], "PUNSUBSCRIBE") || IsName(args[0], "PUBLISH"))
         {
             ctx.TransactionAborted = true;
-            RespWriter.WriteError(output, $"ERR {name} is not allowed inside a transaction");
+            RespWriter.WriteError(output, $"ERR {NameOf(args[0])} is not allowed inside a transaction");
             return;
         }
         if (args.Length < spec.MinArgs || (spec.MaxArgs >= 0 && args.Length > spec.MaxArgs))
         {
             ctx.TransactionAborted = true;
-            RespWriter.WriteError(output, ArityError(name));
+            RespWriter.WriteError(output, ArityError(NameOf(args[0])));
             return;
         }
         ctx.TransactionQueue.Add(args);
@@ -325,6 +365,56 @@ public sealed partial class CommandProcessor
     // ------------------------------------------------------------------
 
     private static string NameOf(byte[] raw) => Encoding.ASCII.GetString(raw).ToUpperInvariant();
+
+    /// <summary>Allocation-free ASCII case-insensitive comparison of a raw command name against an uppercase literal.</summary>
+    private static bool IsName(byte[] raw, string upperLiteral)
+    {
+        if (raw.Length != upperLiteral.Length)
+            return false;
+        for (var i = 0; i < raw.Length; i++)
+        {
+            var b = raw[i];
+            if (b is >= (byte)'a' and <= (byte)'z')
+                b -= 32;
+            if (b != (byte)upperLiteral[i])
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>FNV-1a over ASCII-uppercased bytes: dictionary equality for command names in any client-sent case.</summary>
+    private sealed class AsciiNameComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly AsciiNameComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y)
+        {
+            if (x is null || y is null || x.Length != y.Length)
+                return ReferenceEquals(x, y);
+            for (var i = 0; i < x.Length; i++)
+            {
+                if (Upper(x[i]) != Upper(y[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        public int GetHashCode(byte[] obj)
+        {
+            unchecked
+            {
+                var hash = 2166136261u;
+                foreach (var b in obj)
+                {
+                    hash ^= Upper(b);
+                    hash *= 16777619u;
+                }
+                return (int)hash;
+            }
+        }
+
+        private static byte Upper(byte b) => b is >= (byte)'a' and <= (byte)'z' ? (byte)(b - 32) : b;
+    }
 
     internal static string ArityError(string upperName) =>
         $"ERR wrong number of arguments for '{upperName.ToLowerInvariant()}' command";
@@ -380,6 +470,37 @@ public sealed partial class CommandProcessor
     private void Echo(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
         RespWriter.WriteBulkString(output, args[1]);
 
+    private void Auth(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        byte[] presented;
+        if (args.Length == 3)
+        {
+            // AUTH <username> <password>: only the default user exists;
+            // any other name is indistinguishable from a bad password.
+            if (!args[1].AsSpan().SequenceEqual("default"u8))
+                throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
+            presented = args[2];
+        }
+        else
+        {
+            if (_requirePass is null)
+                throw new RedisCommandException(
+                    "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?");
+            presented = args[1];
+        }
+
+        // With no password configured the default user is passwordless, so
+        // the username form above authenticates unconditionally (as in
+        // Redis, whose default user carries no password then). A failed
+        // attempt never revokes an already authenticated connection.
+        if (_requirePass is not null &&
+            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(presented, _requirePass))
+            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
+
+        ctx.IsAuthenticated = true;
+        RespWriter.WriteSimpleString(output, "OK");
+    }
+
     private void Quit(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         RespWriter.WriteSimpleString(output, "OK");
@@ -409,6 +530,7 @@ public sealed partial class CommandProcessor
             builder.Append("version:1.0.0\r\n");
             builder.Append("os:").Append(Environment.OSVersion.ToString()).Append("\r\n");
             builder.Append("tcp_port:").Append(_port).Append("\r\n");
+            builder.Append("tls_port:").Append(_tlsPort).Append("\r\n");
             builder.Append("uptime_in_seconds:").Append(uptime).Append("\r\n");
         });
         Section("Clients", () =>

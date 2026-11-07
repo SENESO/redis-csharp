@@ -292,7 +292,7 @@ internal sealed class SessionHarness : IAsyncDisposable
     public PersistenceManager Persistence { get; }
     public string DataDirectory => _dataDirectory;
 
-    public static SessionHarness Start(bool appendOnly = false)
+    public static SessionHarness Start(bool appendOnly = false, string? requirePass = null)
     {
         var clock = new FakeTimeProvider();
         var stats = new RedisStats();
@@ -307,7 +307,7 @@ internal sealed class SessionHarness : IAsyncDisposable
         };
         var persistence = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
         var hub = new PubSubHub();
-        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0);
+        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0, requirePass: requirePass);
         return new SessionHarness(store, stats, clock, processor, hub, persistence, directory);
     }
 

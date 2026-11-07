@@ -27,7 +27,9 @@ builder.Services.AddSingleton(sp => new CommandProcessor(
     sp.GetRequiredService<TimeProvider>(),
     sp.GetRequiredService<PersistenceManager>(),
     sp.GetRequiredService<PubSubHub>(),
-    options.Port));
+    options.Port,
+    options.RequirePass,
+    options.TlsPort));
 builder.Services.AddSingleton<TcpServer>();
 builder.Services.AddHostedService<RedisHostedService>();
 builder.Services.AddHostedService<MaintenanceService>();

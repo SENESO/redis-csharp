@@ -12,9 +12,20 @@ namespace RedisServer.Protocol;
 public static class RespWriter
 {
     private static readonly byte[] CrLf = "\r\n"u8.ToArray();
+    private static readonly byte[] OkReply = "+OK\r\n"u8.ToArray();
+    private static readonly byte[] PongReply = "+PONG\r\n"u8.ToArray();
+    private static readonly byte[] QueuedReply = "+QUEUED\r\n"u8.ToArray();
 
     public static void WriteSimpleString(IBufferWriter<byte> output, string text)
     {
+        // The three hottest replies are pre-encoded; everything else takes
+        // the general path.
+        switch (text)
+        {
+            case "OK": output.Write(OkReply); return;
+            case "PONG": output.Write(PongReply); return;
+            case "QUEUED": output.Write(QueuedReply); return;
+        }
         output.Write("+"u8);
         output.Write(Encoding.ASCII.GetBytes(text));
         output.Write(CrLf);

@@ -96,31 +96,35 @@ public sealed class RedisSession
         }
     }
 
-    /// <summary>Processes every complete command in the buffer. Returns true on a protocol error.</summary>
+    /// <summary>
+    /// Processes every complete command in the buffer. All replies produced
+    /// from one read are rendered into a single buffer and queued as one
+    /// frame, so a pipelined batch costs one outbound write instead of one
+    /// per command. Returns true on a protocol error.
+    /// </summary>
     private bool ProcessBuffer(ref ReadOnlySequence<byte> buffer)
     {
+        // Parse every complete command in this read first, then execute
+        // them as one batch under one gate acquisition.
+        _pendingBatch.Clear();
+        string? protocolError = null;
         while (!buffer.IsEmpty)
         {
-            if (!RespParser.TryReadCommand(ref buffer, out var args, out var protocolError))
-            {
-                if (protocolError is not null)
-                {
-                    EnqueueReply(BuildError($"ERR Protocol error: {protocolError}"));
-                    return true;
-                }
-                return false; // incomplete command: wait for more bytes
-            }
-            if (args is not { Length: > 0 })
-                continue; // e.g. a null array: not a command
-
-            var reply = new ArrayBufferWriter<byte>();
-            _processor.Execute(args, _context, reply);
-            if (reply.WrittenCount > 0)
-                _outbound.Writer.TryWrite(reply.WrittenSpan.ToArray());
-            if (_context.CloseRequested)
-                return false;
+            if (!RespParser.TryReadCommand(ref buffer, out var args, out protocolError))
+                break; // incomplete (wait for more bytes) or malformed (protocolError set)
+            if (args is { Length: > 0 })
+                _pendingBatch.Add(args);
+            // else: e.g. a null array — not a command, skipped
         }
-        return false;
+
+        _replyBuffer.ResetWrittenCount();
+        if (_pendingBatch.Count > 0)
+            _processor.ExecuteBatch(_pendingBatch, _context, _replyBuffer);
+        if (protocolError is not null)
+            RespWriter.WriteError(_replyBuffer, $"ERR Protocol error: {protocolError}");
+        if (_replyBuffer.WrittenCount > 0)
+            _outbound.Writer.TryWrite(_replyBuffer.WrittenSpan.ToArray());
+        return protocolError is not null;
     }
 
     private static bool HasPartialArrayStart(ReadOnlySequence<byte> buffer) =>
@@ -135,14 +139,40 @@ public sealed class RedisSession
 
     private void EnqueueReply(byte[] frame) => _outbound.Writer.TryWrite(frame);
 
+    private readonly ArrayBufferWriter<byte> _replyBuffer = new();
+    private readonly List<byte[][]> _pendingBatch = new();
+    private readonly ArrayBufferWriter<byte> _sendBuffer = new();
+
+    /// <summary>Moves every currently queued outbound frame into the send buffer. False when the queue was empty.</summary>
+    private bool DrainOutbound(ChannelReader<byte[]> reader)
+    {
+        _sendBuffer.ResetWrittenCount();
+        var any = false;
+        while (reader.TryRead(out var frame))
+        {
+            _sendBuffer.Write(frame);
+            any = true;
+        }
+        return any;
+    }
+
     private async Task PumpOutputAsync(CancellationToken cancellationToken)
     {
         var writer = _transport.Output;
+        var reader = _outbound.Reader;
         try
         {
-            await foreach (var frame in _outbound.Reader.ReadAllAsync(cancellationToken))
+            // Drain every queued frame into one buffer and write once per
+            // burst, instead of one flushing write per frame.
+            while (true)
             {
-                var result = await writer.WriteAsync(frame, cancellationToken);
+                if (!DrainOutbound(reader))
+                {
+                    if (!await reader.WaitToReadAsync(cancellationToken))
+                        break; // channel completed and empty: nothing left
+                    continue;
+                }
+                var result = await writer.WriteAsync(_sendBuffer.WrittenMemory, cancellationToken);
                 if (result.IsCompleted)
                     break;
             }

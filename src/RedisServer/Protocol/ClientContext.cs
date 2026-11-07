@@ -19,6 +19,14 @@ public sealed class ClientContext
 
     public bool CloseRequested { get; set; }
 
+    /// <summary>
+    /// True once this connection has presented the configured password
+    /// (only meaningful when the server runs with one; the processor never
+    /// consults it otherwise). Server-internal execution (AOF replay) marks
+    /// its throwaway context authenticated — replay is not a client.
+    /// </summary>
+    public bool IsAuthenticated { get; set; }
+
     public HashSet<byte[]> Channels { get; } = new(ByteArrayComparer.Instance);
 
     public HashSet<byte[]> Patterns { get; } = new(ByteArrayComparer.Instance);

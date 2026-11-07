@@ -12,6 +12,14 @@ namespace RedisServer.Options;
 /// <item><c>--appendonly yes|no</c> — enable the append-only file (default no)</item>
 /// <item><c>--appendfilename &lt;name&gt;</c> — AOF file name (default <c>appendonly.aof</c>)</item>
 /// <item><c>--appendfsync always|everysec|no</c> — AOF fsync policy (default everysec)</item>
+/// <item><c>--requirepass &lt;password&gt;</c> — when set, connections must <c>AUTH</c> before any
+/// other command (default: no password; the <c>REDIS_REQUIREPASS</c> environment variable is the fallback)</item>
+/// <item><c>--tls-port &lt;port&gt;</c> — additional TLS listener port (default 0: disabled). The plaintext
+/// port keeps serving; TLS is an extra door, not a replacement</item>
+/// <item><c>--tls-cert-file &lt;path&gt;</c> — PKCS#12 (.pfx) file holding the server certificate and key,
+/// required when <c>--tls-port</c> is set</item>
+/// <item><c>--tls-cert-password &lt;password&gt;</c> — password for the certificate file (default: the
+/// <c>REDIS_TLS_CERT_PASSWORD</c> environment variable, so the secret need not appear in the process list)</item>
 /// </list>
 /// </summary>
 public sealed class ServerOptions
@@ -30,6 +38,18 @@ public sealed class ServerOptions
 
     public AofFsyncPolicy AppendFsync { get; init; } = AofFsyncPolicy.EverySec;
 
+    /// <summary>The password connections must present with AUTH, or null for no authentication.</summary>
+    public string? RequirePass { get; init; }
+
+    /// <summary>Additional TLS listener port; 0 disables the TLS listener.</summary>
+    public int TlsPort { get; init; }
+
+    /// <summary>Path of the PKCS#12 file with the TLS server certificate; required when TlsPort is set.</summary>
+    public string? TlsCertFile { get; init; }
+
+    /// <summary>Password for the TLS certificate file, when it has one.</summary>
+    public string? TlsCertPassword { get; init; }
+
     public static ServerOptions FromArgs(string[] args)
     {
         var port = DefaultPort;
@@ -38,6 +58,10 @@ public sealed class ServerOptions
         var appendOnly = false;
         var appendFileName = "appendonly.aof";
         var appendFsync = AofFsyncPolicy.EverySec;
+        var requirePass = Environment.GetEnvironmentVariable("REDIS_REQUIREPASS");
+        var tlsPort = 0;
+        var tlsCertFile = (string?)null;
+        var tlsCertPassword = Environment.GetEnvironmentVariable("REDIS_TLS_CERT_PASSWORD");
 
         for (var i = 0; i < args.Length - 1; i++)
         {
@@ -59,6 +83,18 @@ public sealed class ServerOptions
                 case "--appendfilename":
                     appendFileName = value;
                     break;
+                case "--requirepass":
+                    requirePass = value;
+                    break;
+                case "--tls-port" when int.TryParse(value, out var parsedTlsPort):
+                    tlsPort = parsedTlsPort;
+                    break;
+                case "--tls-cert-file":
+                    tlsCertFile = value;
+                    break;
+                case "--tls-cert-password":
+                    tlsCertPassword = value;
+                    break;
                 case "--appendfsync":
                     appendFsync = value.ToLowerInvariant() switch
                     {
@@ -77,7 +113,11 @@ public sealed class ServerOptions
             SnapshotFileName = snapshotFileName,
             AppendOnly = appendOnly,
             AppendFileName = appendFileName,
-            AppendFsync = appendFsync
+            AppendFsync = appendFsync,
+            RequirePass = string.IsNullOrEmpty(requirePass) ? null : requirePass,
+            TlsPort = tlsPort,
+            TlsCertFile = tlsCertFile,
+            TlsCertPassword = tlsCertPassword
         };
     }
 }
