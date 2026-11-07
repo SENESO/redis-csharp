@@ -13,12 +13,14 @@ public sealed class RedisStats
     private long _keyspaceHits;
     private long _keyspaceMisses;
     private long _expiredKeys;
+    private long _evictedKeys;
     private long _publishedMessages;
 
     public void AddCommand() => Interlocked.Increment(ref _totalCommandsProcessed);
     public void AddKeyspaceHit() => Interlocked.Increment(ref _keyspaceHits);
     public void AddKeyspaceMiss() => Interlocked.Increment(ref _keyspaceMisses);
     public void AddExpiredKey() => Interlocked.Increment(ref _expiredKeys);
+    public void AddEvictedKey() => Interlocked.Increment(ref _evictedKeys);
     public void AddPublishedMessage() => Interlocked.Increment(ref _publishedMessages);
 
     public void ConnectionOpened()
@@ -35,5 +37,6 @@ public sealed class RedisStats
     public long KeyspaceHits => Interlocked.Read(ref _keyspaceHits);
     public long KeyspaceMisses => Interlocked.Read(ref _keyspaceMisses);
     public long ExpiredKeys => Interlocked.Read(ref _expiredKeys);
+    public long EvictedKeys => Interlocked.Read(ref _evictedKeys);
     public long PublishedMessages => Interlocked.Read(ref _publishedMessages);
 }

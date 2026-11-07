@@ -166,14 +166,15 @@ public sealed class PersistenceManager : IDisposable
     {
         if (_aof is not null && File.Exists(AofPath) && new FileInfo(AofPath).Length > 0)
         {
-            var commands = AppendOnlyFile.ReadCommands(AofPath, out var truncatedTail);
-            var applied = 0;
-            foreach (var command in commands)
+            // Streamed: commands are parsed and replayed one at a time
+            // in bounded memory, however large the file has grown.
+            long applied = 0;
+            var read = AppendOnlyFile.StreamCommands(AofPath, command =>
             {
                 if (replayCommand(command))
                     applied++;
-            }
-            _logger.LogInformation("Loaded {Count} commands from the AOF ({Applied} applied).", commands.Count, applied);
+            }, out var truncatedTail);
+            _logger.LogInformation("Loaded {Count} commands from the AOF ({Applied} applied).", read, applied);
             if (truncatedTail)
             {
                 _logger.LogWarning(

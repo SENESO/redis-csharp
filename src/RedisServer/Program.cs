@@ -29,7 +29,9 @@ builder.Services.AddSingleton(sp => new CommandProcessor(
     sp.GetRequiredService<PubSubHub>(),
     options.Port,
     options.RequirePass,
-    options.TlsPort));
+    options.TlsPort,
+    options.MaxMemory,
+    options.MaxMemoryPolicy));
 builder.Services.AddSingleton<TcpServer>();
 builder.Services.AddHostedService<RedisHostedService>();
 builder.Services.AddHostedService<MaintenanceService>();

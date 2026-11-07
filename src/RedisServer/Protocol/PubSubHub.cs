@@ -112,14 +112,14 @@ public sealed class PubSubHub
             if (_channels.TryGetValue(channel, out var direct))
             {
                 foreach (var ctx in direct)
-                    deliveries.Add((ctx, BuildMessageFrame(null, channel, message)));
+                    deliveries.Add((ctx, BuildMessageFrame(null, channel, message, ctx.ProtocolVersion)));
             }
             foreach (var (pattern, subscribers) in _patterns)
             {
                 if (!Glob.IsMatch(pattern, channel))
                     continue;
                 foreach (var ctx in subscribers)
-                    deliveries.Add((ctx, BuildMessageFrame(pattern, channel, message)));
+                    deliveries.Add((ctx, BuildMessageFrame(pattern, channel, message, ctx.ProtocolVersion)));
             }
         }
 
@@ -128,17 +128,19 @@ public sealed class PubSubHub
         return deliveries.Count;
     }
 
-    private static byte[] BuildMessageFrame(byte[]? pattern, byte[] channel, byte[] message)
+    private static byte[] BuildMessageFrame(byte[]? pattern, byte[] channel, byte[] message, int protocolVersion)
     {
+        // Each subscriber's frame is rendered in its own negotiated
+        // protocol: a push (>) for RESP3 subscribers, an array for RESP2.
         var buffer = new ArrayBufferWriter<byte>();
         if (pattern is null)
         {
-            RespWriter.WriteArrayHeader(buffer, 3);
+            RespWriter.WritePushOrArrayHeader(buffer, 3, protocolVersion);
             RespWriter.WriteBulkString(buffer, "message");
         }
         else
         {
-            RespWriter.WriteArrayHeader(buffer, 4);
+            RespWriter.WritePushOrArrayHeader(buffer, 4, protocolVersion);
             RespWriter.WriteBulkString(buffer, "pmessage");
             RespWriter.WriteBulkString(buffer, pattern);
         }

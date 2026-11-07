@@ -107,30 +107,65 @@ public sealed class AppendOnlyFile : IDisposable
     }
 
     /// <summary>
-    /// Reads the whole file as a command stream for replay. A torn tail
-    /// (crash mid-append) ends the stream quietly with
-    /// <paramref name="truncatedTail"/> set; every complete command before
-    /// it is returned.
+    /// Streams the file's commands one at a time for replay, in bounded
+    /// memory: the file is read in chunks through a pipe and each parsed
+    /// command is handed to <paramref name="onCommand"/> and released —
+    /// a hundreds-of-megabytes AOF loads without ever being resident.
+    /// A torn tail (crash mid-append) ends the stream quietly with
+    /// <paramref name="truncatedTail"/> set; every complete command
+    /// before it has been delivered. Returns the number delivered.
+    /// </summary>
+    public static long StreamCommands(string path, Action<byte[][]> onCommand, out bool truncatedTail)
+    {
+        truncatedTail = false;
+        if (!File.Exists(path))
+            return 0;
+
+        long delivered = 0;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 64 * 1024);
+        var reader = System.IO.Pipelines.PipeReader.Create(stream);
+        try
+        {
+            while (true)
+            {
+                var result = reader.ReadAsync().AsTask().GetAwaiter().GetResult();
+                var buffer = result.Buffer;
+                while (RespParser.TryReadCommand(ref buffer, out var args, out _))
+                {
+                    if (args is { Length: > 0 })
+                    {
+                        onCommand(args);
+                        delivered++;
+                    }
+                }
+                if (result.IsCompleted)
+                {
+                    // Whatever remains unparsed is an incomplete or
+                    // malformed tail from a torn final write.
+                    truncatedTail = !buffer.IsEmpty;
+                    reader.AdvanceTo(buffer.End);
+                    break;
+                }
+                reader.AdvanceTo(buffer.Start, buffer.End);
+            }
+        }
+        finally
+        {
+            reader.Complete();
+        }
+        return delivered;
+    }
+
+    /// <summary>
+    /// Reads the whole file as a command list. Convenience for tests and
+    /// tooling — startup replay uses <see cref="StreamCommands"/> so the
+    /// file is never held in memory whole.
     /// </summary>
     public static IReadOnlyList<byte[][]> ReadCommands(string path, out bool truncatedTail)
     {
-        truncatedTail = false;
         var commands = new List<byte[][]>();
-        if (!File.Exists(path))
-            return commands;
-
-        var bytes = File.ReadAllBytes(path);
-        var buffer = new ReadOnlySequence<byte>(bytes);
-        while (!buffer.IsEmpty)
-        {
-            if (!RespParser.TryReadCommand(ref buffer, out var args, out var error))
-            {
-                truncatedTail = true; // incomplete or malformed tail: keep everything before it
-                break;
-            }
-            if (args is { Length: > 0 })
-                commands.Add(args);
-        }
+        StreamCommands(path, commands.Add, out truncatedTail);
         return commands;
     }
 

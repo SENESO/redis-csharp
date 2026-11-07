@@ -47,10 +47,14 @@ public sealed partial class CommandProcessor
 
     private delegate void CommandHandler(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects);
 
-    private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler);
+    private sealed record CommandSpec(int MinArgs, int MaxArgs, bool AllowedInPubSub, CommandHandler Handler, bool DenyOom = false);
+
+    private readonly long _maxMemory;
+    private readonly MaxMemoryPolicy _maxMemoryPolicy;
 
     public CommandProcessor(RedisStore store, RedisStats stats, TimeProvider clock,
-        PersistenceManager persistence, PubSubHub hub, int port, string? requirePass = null, int tlsPort = 0)
+        PersistenceManager persistence, PubSubHub hub, int port, string? requirePass = null, int tlsPort = 0,
+        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction)
     {
         _store = store;
         _stats = stats;
@@ -60,6 +64,8 @@ public sealed partial class CommandProcessor
         _port = port;
         _tlsPort = tlsPort;
         _requirePass = requirePass is null ? null : Encoding.UTF8.GetBytes(requirePass);
+        _maxMemory = maxMemory;
+        _maxMemoryPolicy = maxMemoryPolicy;
         _startedAt = clock.GetUtcNow();
         _specs = BuildSpecs();
     }
@@ -70,13 +76,15 @@ public sealed partial class CommandProcessor
         // comparison, so the hot path never materialises the name as a
         // string; names are only stringified on error paths.
         var specs = new Dictionary<byte[], CommandSpec>(AsciiNameComparer.Instance);
-        void Add(string name, int min, int max, CommandHandler handler, bool pubsub = false) =>
-            specs[Ascii(name)] = new CommandSpec(min, max, pubsub, handler);
+        void Add(string name, int min, int max, CommandHandler handler, bool pubsub = false, bool denyOom = false) =>
+            specs[Ascii(name)] = new CommandSpec(min, max, pubsub, handler, denyOom);
 
         // Connection / server
         Add("PING", 1, 2, Ping, pubsub: true);
         Add("ECHO", 2, 2, Echo);
         Add("AUTH", 2, 3, Auth);
+        Add("HELLO", 1, -1, Hello);
+        Add("CLIENT", 2, -1, Client);
         Add("QUIT", 1, 1, Quit, pubsub: true);
         Add("DBSIZE", 1, 1, DbSize);
         Add("INFO", 1, 2, Info);
@@ -87,15 +95,15 @@ public sealed partial class CommandProcessor
         Add("BGREWRITEAOF", 1, 1, BgRewriteAof);
 
         // Strings
-        Add("SET", 3, -1, Set);
+        Add("SET", 3, -1, Set, denyOom: true);
         Add("GET", 2, 2, Get);
         Add("DEL", 2, -1, Del);
         Add("EXISTS", 2, -1, Exists);
-        Add("INCR", 2, 2, Incr);
-        Add("DECR", 2, 2, Decr);
-        Add("INCRBY", 3, 3, IncrBy);
-        Add("DECRBY", 3, 3, DecrBy);
-        Add("APPEND", 3, 3, Append);
+        Add("INCR", 2, 2, Incr, denyOom: true);
+        Add("DECR", 2, 2, Decr, denyOom: true);
+        Add("INCRBY", 3, 3, IncrBy, denyOom: true);
+        Add("DECRBY", 3, 3, DecrBy, denyOom: true);
+        Add("APPEND", 3, 3, Append, denyOom: true);
         Add("STRLEN", 2, 2, StrLen);
 
         // Keys
@@ -111,24 +119,25 @@ public sealed partial class CommandProcessor
         Add("SCAN", 2, -1, Scan);
 
         // Collections (CommandProcessorCollections.cs)
-        Add("LPUSH", 3, -1, LeftPush);
-        Add("RPUSH", 3, -1, RightPush);
+        Add("LPUSH", 3, -1, LeftPush, denyOom: true);
+        Add("RPUSH", 3, -1, RightPush, denyOom: true);
         Add("LPOP", 2, 3, LeftPop);
         Add("RPOP", 2, 3, RightPop);
         Add("LLEN", 2, 2, ListLength);
         Add("LRANGE", 4, 4, ListRange);
         Add("LINDEX", 3, 3, ListIndex);
-        Add("SADD", 3, -1, SetAdd);
+        Add("SADD", 3, -1, SetAdd, denyOom: true);
         Add("SREM", 3, -1, SetRemove);
         Add("SMEMBERS", 2, 2, SetMembers);
         Add("SISMEMBER", 3, 3, SetIsMember);
         Add("SCARD", 2, 2, SetCard);
-        Add("HSET", 4, -1, HashSet);
+        Add("HSET", 4, -1, HashSet, denyOom: true);
         Add("HGET", 3, 3, HashGet);
         Add("HDEL", 3, -1, HashDelete);
         Add("HGETALL", 2, 2, HashGetAll);
         Add("HLEN", 2, 2, HashLength);
-        Add("ZADD", 4, -1, ZAdd);
+        Add("ZADD", 4, -1, ZAdd, denyOom: true);
+        Add("ZINCRBY", 4, 4, ZIncrBy, denyOom: true);
         Add("ZSCORE", 3, 3, ZScore);
         Add("ZRANGE", 4, 5, ZRange);
         Add("ZREM", 3, -1, ZRemove);
@@ -196,7 +205,7 @@ public sealed partial class CommandProcessor
     /// </summary>
     public bool ExecuteReplay(byte[][] args)
     {
-        var ctx = new ClientContext { IsAuthenticated = true };
+        var ctx = new ClientContext { IsAuthenticated = true, IsServerInternal = true };
         var sink = new ArrayBufferWriter<byte>();
         lock (_gate)
         {
@@ -219,12 +228,14 @@ public sealed partial class CommandProcessor
         var rawName = args[0];
 
         // Authentication gate: with a password configured, an
-        // unauthenticated connection may only AUTH or QUIT — every other
-        // command (including MULTI/EXEC and unknown commands) is answered
-        // NOAUTH, exactly as Redis orders it. Transaction bodies are not
-        // re-checked: the EXEC that carries them passed the gate itself.
+        // unauthenticated connection may only AUTH, HELLO or QUIT — every
+        // other command (including MULTI/EXEC and unknown commands) is
+        // answered NOAUTH, exactly as Redis orders it. HELLO is exempt
+        // because it carries its own authentication clause and its own,
+        // longer NOAUTH text (see the Hello handler). Transaction bodies
+        // are not re-checked: the EXEC that carries them passed the gate.
         if (!inTransactionBody && _requirePass is not null && !ctx.IsAuthenticated &&
-            !IsName(rawName, "AUTH") && !IsName(rawName, "QUIT"))
+            !IsName(rawName, "AUTH") && !IsName(rawName, "QUIT") && !IsName(rawName, "HELLO"))
         {
             RespWriter.WriteError(output, "NOAUTH Authentication required.");
             return;
@@ -288,6 +299,33 @@ public sealed partial class CommandProcessor
         {
             RespWriter.WriteError(output, ArityError(NameOf(rawName)));
             return;
+        }
+
+        // Memory ceiling (--maxmemory), checked before the command runs,
+        // exactly where Redis checks it: with an evicting policy, keys
+        // are evicted first (their DEL effects join this command's
+        // effect list, so they reach the AOF ahead of it and replay in
+        // the same order); a write that may allocate is refused with the
+        // OOM error only when the store is still over the ceiling after
+        // eviction — or immediately under noeviction. Reads are never
+        // refused. Replay and other server-internal execution skip the
+        // gate: the AOF only holds commands that already passed it.
+        if (!ctx.IsServerInternal && _maxMemory > 0 && _store.UsedMemory > _maxMemory)
+        {
+            if (_maxMemoryPolicy != MaxMemoryPolicy.NoEviction)
+            {
+                var guard = 0;
+                while (_store.UsedMemory > _maxMemory && guard++ < 100_000 &&
+                       _store.TryEvictOne(_maxMemoryPolicy) is { } victim)
+                {
+                    effects.Add(new[] { Ascii("DEL"), victim });
+                }
+            }
+            if (spec.DenyOom && _store.UsedMemory > _maxMemory)
+            {
+                RespWriter.WriteError(output, "OOM command not allowed when used memory > 'maxmemory'.");
+                return;
+            }
         }
 
         try
@@ -452,10 +490,86 @@ public sealed partial class CommandProcessor
     // Connection / server commands
     // ------------------------------------------------------------------
 
+    /// <summary>
+    /// CLIENT SETNAME / GETNAME / SETINFO / ID. SETINFO arrived in Redis
+    /// 7.2 (a 7.0 server answers "unknown subcommand"), but real client
+    /// libraries — redis-py among them — send it on every connect and
+    /// tolerate its failure; accepting it costs nothing and the library
+    /// name/version are kept on the connection. Error texts probed
+    /// against redis-server 7.0.15 (the unknown-subcommand text also
+    /// covers SETINFO there; the SETINFO-attribute error is the 7.2
+    /// form).
+    /// </summary>
+    private void Client(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        switch (NameOf(args[1]))
+        {
+            case "SETNAME":
+                if (args.Length != 3)
+                {
+                    RespWriter.WriteError(output, ArityError("CLIENT"));
+                    return;
+                }
+                SetClientName(ctx, args[2]); // throws the client-name error on bad characters
+                RespWriter.WriteSimpleString(output, "OK");
+                return;
+            case "GETNAME":
+                if (args.Length != 2)
+                {
+                    RespWriter.WriteError(output, ArityError("CLIENT"));
+                    return;
+                }
+                RespWriter.WriteBulkStringOrNull(output, ctx.Name, ctx.ProtocolVersion);
+                return;
+            case "SETINFO":
+                if (args.Length != 4)
+                {
+                    RespWriter.WriteError(output, ArityError("CLIENT"));
+                    return;
+                }
+                var attribute = NameOf(args[2]);
+                if (attribute == "LIB-NAME")
+                    ctx.LibraryName = Encoding.UTF8.GetString(args[3]);
+                else if (attribute == "LIB-VER")
+                    ctx.LibraryVersion = Encoding.UTF8.GetString(args[3]);
+                else
+                {
+                    RespWriter.WriteError(output,
+                        $"ERR Unknown subcommand or wrong number of arguments for '{attribute.ToLowerInvariant()}'. Try CLIENT SETINFO HELP.");
+                    return;
+                }
+                RespWriter.WriteSimpleString(output, "OK");
+                return;
+            case "ID":
+                if (args.Length != 2)
+                {
+                    RespWriter.WriteError(output, ArityError("CLIENT"));
+                    return;
+                }
+                RespWriter.WriteInteger(output, ctx.Id);
+                return;
+            default:
+                RespWriter.WriteError(output,
+                    $"ERR unknown subcommand '{RespParser.Describe(args[1])}'. Try CLIENT HELP.");
+                return;
+        }
+    }
+
     private void Ping(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         if (ctx.IsSubscribed)
         {
+            if (ctx.ProtocolVersion >= 3)
+            {
+                // RESP3 drops the pong array: no argument answers a plain
+                // +PONG and an argument answers with the bare bulk string
+                // (both probed byte-for-byte against redis-server 7.0.15).
+                if (args.Length == 2)
+                    RespWriter.WriteBulkString(output, args[1]);
+                else
+                    RespWriter.WriteSimpleString(output, "PONG");
+                return;
+            }
             RespWriter.WriteArrayHeader(output, 2);
             RespWriter.WriteBulkString(output, "pong");
             RespWriter.WriteBulkString(output, args.Length == 2 ? args[1] : Array.Empty<byte>());
@@ -501,6 +615,115 @@ public sealed partial class CommandProcessor
         RespWriter.WriteSimpleString(output, "OK");
     }
 
+    /// <summary>
+    /// Validates and stores a client name (HELLO ... SETNAME and CLIENT
+    /// SETNAME share the rule): bytes must be printable, non-space ASCII;
+    /// an empty name clears the current one. Returns the stored copy.
+    /// </summary>
+    internal static void SetClientName(ClientContext ctx, byte[] name)
+    {
+        foreach (var b in name)
+        {
+            if (b < 33 || b > 126)
+                throw new RedisCommandException(
+                    "ERR Client names cannot contain spaces, newlines or special characters.");
+        }
+        ctx.Name = name.Length == 0 ? null : name.ToArray();
+    }
+
+    /// <summary>
+    /// HELLO [protover] [AUTH user pass] [SETNAME name]: negotiates the
+    /// protocol version and answers with the server handshake. The reply
+    /// is a flat array of key/value pairs in RESP2 and a map in RESP3 —
+    /// rendered in the version being switched <em>to</em>, as in Redis.
+    ///
+    /// Error order, probed against redis-server 7.0.15: a non-integer
+    /// protocol version, then NOPROTO for a version other than 2 or 3,
+    /// then per-clause syntax errors and WRONGPASS as the clauses are
+    /// applied in order, and only at the end — when a password is
+    /// configured and the connection is still unauthenticated — HELLO's
+    /// own NOAUTH text.
+    /// </summary>
+    private void Hello(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        var proto = ctx.ProtocolVersion;
+        var i = 1;
+        if (args.Length > 1)
+        {
+            if (!long.TryParse(RespParser.Describe(args[1]), NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out var version))
+                throw new RedisCommandException("ERR Protocol version is not an integer or out of range");
+            if (version is not (2 or 3))
+                throw new RedisCommandException("NOPROTO unsupported protocol version");
+            proto = (int)version;
+            i = 2;
+        }
+
+        for (; i < args.Length; i++)
+        {
+            switch (NameOf(args[i]))
+            {
+                case "AUTH":
+                    if (i + 2 >= args.Length)
+                        throw new RedisCommandException("ERR Syntax error in HELLO option 'AUTH'");
+                    AuthenticateHello(args[i + 1], args[i + 2], ctx);
+                    i += 2;
+                    break;
+                case "SETNAME":
+                    if (i + 1 >= args.Length)
+                        throw new RedisCommandException("ERR Syntax error in HELLO option 'SETNAME'");
+                    SetClientName(ctx, args[i + 1]);
+                    i += 1;
+                    break;
+                default:
+                    throw new RedisCommandException(
+                        $"ERR Syntax error in HELLO option '{RespParser.Describe(args[i])}'");
+            }
+        }
+
+        if (_requirePass is not null && !ctx.IsAuthenticated)
+            throw new RedisCommandException(
+                "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time");
+
+        ctx.ProtocolVersion = proto;
+        if (proto >= 3)
+            RespWriter.WriteMapHeader(output, 7);
+        else
+            RespWriter.WriteArrayHeader(output, 14);
+        WriteHelloPair(output, "server", "redis-csharp");
+        WriteHelloPair(output, "version", "1.0.0");
+        RespWriter.WriteBulkString(output, "proto");
+        RespWriter.WriteInteger(output, proto);
+        RespWriter.WriteBulkString(output, "id");
+        RespWriter.WriteInteger(output, ctx.Id);
+        WriteHelloPair(output, "mode", "standalone");
+        WriteHelloPair(output, "role", "master");
+        RespWriter.WriteBulkString(output, "modules");
+        RespWriter.WriteArrayHeader(output, 0);
+    }
+
+    private static void WriteHelloPair(IBufferWriter<byte> output, string key, string value)
+    {
+        RespWriter.WriteBulkString(output, key);
+        RespWriter.WriteBulkString(output, value);
+    }
+
+    /// <summary>
+    /// The AUTH clause of HELLO: unlike the AUTH command, presenting any
+    /// password succeeds when none is configured (the default user is
+    /// passwordless then); a wrong one fails with WRONGPASS and leaves
+    /// both the protocol version and the authentication state untouched.
+    /// </summary>
+    private void AuthenticateHello(byte[] user, byte[] password, ClientContext ctx)
+    {
+        if (!user.AsSpan().SequenceEqual("default"u8))
+            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
+        if (_requirePass is not null &&
+            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(password, _requirePass))
+            throw new RedisCommandException("WRONGPASS invalid username-password pair or user is disabled.");
+        ctx.IsAuthenticated = true;
+    }
+
     private void Quit(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         RespWriter.WriteSimpleString(output, "OK");
@@ -509,6 +732,16 @@ public sealed partial class CommandProcessor
 
     private void DbSize(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
         RespWriter.WriteInteger(output, _store.Count);
+
+    internal static string PolicyName(MaxMemoryPolicy policy) => policy switch
+    {
+        MaxMemoryPolicy.AllKeysLru => "allkeys-lru",
+        MaxMemoryPolicy.AllKeysRandom => "allkeys-random",
+        MaxMemoryPolicy.VolatileLru => "volatile-lru",
+        MaxMemoryPolicy.VolatileRandom => "volatile-random",
+        MaxMemoryPolicy.VolatileTtl => "volatile-ttl",
+        _ => "noeviction"
+    };
 
     private void Info(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
@@ -537,6 +770,16 @@ public sealed partial class CommandProcessor
         {
             builder.Append("connected_clients:").Append(_stats.CurrConnections).Append("\r\n");
         });
+        Section("Memory", () =>
+        {
+            // used_memory is this server's data-only estimate (see
+            // RedisStore): Redis's figure also counts allocator and
+            // server overhead, so the two are comparable in shape, not
+            // in absolute value.
+            builder.Append("used_memory:").Append(_store.UsedMemory).Append("\r\n");
+            builder.Append("maxmemory:").Append(_maxMemory).Append("\r\n");
+            builder.Append("maxmemory_policy:").Append(PolicyName(_maxMemoryPolicy)).Append("\r\n");
+        });
         Section("Persistence", () =>
         {
             builder.Append("aof_enabled:").Append(_persistence.AofEnabled ? 1 : 0).Append("\r\n");
@@ -549,6 +792,7 @@ public sealed partial class CommandProcessor
             builder.Append("keyspace_hits:").Append(_stats.KeyspaceHits).Append("\r\n");
             builder.Append("keyspace_misses:").Append(_stats.KeyspaceMisses).Append("\r\n");
             builder.Append("expired_keys:").Append(_stats.ExpiredKeys).Append("\r\n");
+            builder.Append("evicted_keys:").Append(_stats.EvictedKeys).Append("\r\n");
             builder.Append("pubsub_channels:").Append(_hub.ChannelCount).Append("\r\n");
             builder.Append("pubsub_patterns:").Append(_hub.PatternCount).Append("\r\n");
         });
@@ -559,6 +803,14 @@ public sealed partial class CommandProcessor
                 .Append(",avg_ttl=0\r\n");
         });
 
+        var text = builder.ToString();
+        if (ctx.ProtocolVersion >= 3)
+        {
+            // In RESP3, INFO is a verbatim string (format tag "txt") —
+            // including for an unknown section, whose text is empty.
+            RespWriter.WriteVerbatimString(output, text);
+            return;
+        }
         if (builder.Length == 0)
         {
             // An unknown section is not an error in Redis: the reply is
@@ -566,7 +818,7 @@ public sealed partial class CommandProcessor
             RespWriter.WriteBulkString(output, "");
             return;
         }
-        RespWriter.WriteBulkString(output, builder.ToString());
+        RespWriter.WriteBulkString(output, text);
     }
 
     private void FlushDb(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
@@ -704,11 +956,11 @@ public sealed partial class CommandProcessor
         if (returnOld)
             // Redis returns the old value even when NX/XX declined the
             // write; only a missing key answers nil.
-            RespWriter.WriteBulkStringOrNull(output, oldValue);
+            RespWriter.WriteBulkStringOrNull(output, oldValue, ctx.ProtocolVersion);
         else if (outcome == SetOutcome.Stored)
             RespWriter.WriteSimpleString(output, "OK");
         else
-            RespWriter.WriteNullBulkString(output);
+            RespWriter.WriteNull(output, ctx.ProtocolVersion);
     }
 
     private void Get(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
@@ -718,7 +970,7 @@ public sealed partial class CommandProcessor
             _stats.AddKeyspaceMiss();
         else
             _stats.AddKeyspaceHit();
-        RespWriter.WriteBulkStringOrNull(output, value);
+        RespWriter.WriteBulkStringOrNull(output, value, ctx.ProtocolVersion);
     }
 
     private void Del(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)

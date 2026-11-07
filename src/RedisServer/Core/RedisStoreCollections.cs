@@ -54,7 +54,10 @@ public sealed partial class RedisStore
             foreach (var member in members)
             {
                 if (set.Add(member))
+                {
+                    _usedMemory += CollectionElementSize(member);
                     added++;
+                }
             }
             return added;
         }
@@ -72,7 +75,10 @@ public sealed partial class RedisStore
             foreach (var member in members)
             {
                 if (set.Remove(member))
+                {
+                    _usedMemory -= CollectionElementSize(member);
                     removed++;
+                }
             }
             RemoveIfEmpty(key, entry);
             return removed;
@@ -123,8 +129,15 @@ public sealed partial class RedisStore
             long added = 0;
             foreach (var (field, value) in pairs)
             {
-                if (!hash.ContainsKey(field))
+                if (hash.TryGetValue(field, out var old))
+                {
+                    _usedMemory += value.Length - old.Length;
+                }
+                else
+                {
+                    _usedMemory += CollectionElementSize(field) + value.Length;
                     added++;
+                }
                 hash[field] = value;
             }
             return added;
@@ -153,8 +166,11 @@ public sealed partial class RedisStore
             long removed = 0;
             foreach (var field in fields)
             {
-                if (hash.Remove(field))
+                if (hash.TryGetValue(field, out var old) && hash.Remove(field))
+                {
+                    _usedMemory -= CollectionElementSize(field) + old.Length;
                     removed++;
+                }
             }
             RemoveIfEmpty(key, entry);
             return removed;
@@ -200,7 +216,13 @@ public sealed partial class RedisStore
                 var (delta, member) = items[0];
                 var exists = zset.Scores.TryGetValue(member, out var current);
                 if (!exists && (mode == ZAddMode.OnlyExisting || requireExisting))
+                {
+                    // A declined INCR on a missing key must not leave the
+                    // just-created empty entry behind (real Redis creates
+                    // nothing); the non-increment path already cleans up.
+                    RemoveIfEmpty(key, entry);
                     return new ZAddResult(0, 0, null);
+                }
                 if (exists && mode == ZAddMode.OnlyNew)
                     return new ZAddResult(0, 0, null);
 
@@ -213,6 +235,8 @@ public sealed partial class RedisStore
                     return new ZAddResult(0, 0, null);
 
                 ApplyZScore(zset, member, next);
+                if (!exists)
+                    _usedMemory += ZSetElementSize(member);
                 return new ZAddResult(exists ? 0 : 1, exists ? 1 : 0, next);
             }
 
@@ -227,6 +251,7 @@ public sealed partial class RedisStore
                     if (mode == ZAddMode.OnlyExisting || requireExisting)
                         continue;
                     ApplyZScore(zset, member, score);
+                    _usedMemory += ZSetElementSize(member);
                     added++;
                     continue;
                 }
@@ -305,6 +330,7 @@ public sealed partial class RedisStore
                 {
                     zset.Scores.Remove(member);
                     zset.Sorted.Remove(new ZSetNode(score, member));
+                    _usedMemory -= ZSetElementSize(member);
                     removed++;
                 }
             }
@@ -389,7 +415,11 @@ public sealed partial class RedisStore
                 RedisType.ZSet => BuildZSet((List<KeyValuePair<byte[], double>>)exported.Value),
                 _ => throw new InvalidOperationException($"Unknown entry type {exported.Type}")
             };
-            _data[exported.Key] = new RedisEntry { Type = exported.Type, Value = value, ExpiresAt = exported.ExpiresAt };
+            if (_data.TryGetValue(exported.Key, out var replaced))
+                _usedMemory -= EstimateEntrySize(exported.Key, replaced);
+            var entry = new RedisEntry { Type = exported.Type, Value = value, ExpiresAt = exported.ExpiresAt };
+            _data[exported.Key] = entry;
+            _usedMemory += EstimateEntrySize(exported.Key, entry);
         }
     }
 

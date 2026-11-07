@@ -168,12 +168,12 @@ public sealed partial class CommandProcessor
     }
 
     private void LeftPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        PopCore(args, left: true, output, effects);
+        PopCore(args, left: true, ctx, output, effects);
 
     private void RightPop(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        PopCore(args, left: false, output, effects);
+        PopCore(args, left: false, ctx, output, effects);
 
-    private void PopCore(byte[][] args, bool left, IBufferWriter<byte> output, List<byte[][]> effects)
+    private void PopCore(byte[][] args, bool left, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         var key = args[1];
         if (args.Length == 2)
@@ -181,7 +181,7 @@ public sealed partial class CommandProcessor
             var value = left ? _store.LeftPop(key) : _store.RightPop(key);
             if (value is not null)
                 effects.Add(args);
-            RespWriter.WriteBulkStringOrNull(output, value);
+            RespWriter.WriteBulkStringOrNull(output, value, ctx.ProtocolVersion);
             return;
         }
 
@@ -189,7 +189,7 @@ public sealed partial class CommandProcessor
             throw new ValueErrorException("ERR value is out of range, must be positive");
         if (_store.TypeOf(key) == RedisType.None)
         {
-            RespWriter.WriteNullArray(output);
+            RespWriter.WriteNullArrayValue(output, ctx.ProtocolVersion);
             return;
         }
         var values = left ? _store.LeftPop(key, count) : _store.RightPop(key, count);
@@ -212,7 +212,7 @@ public sealed partial class CommandProcessor
     }
 
     private void ListIndex(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteBulkStringOrNull(output, _store.ListIndex(args[1], ParseLong(args[2])));
+        RespWriter.WriteBulkStringOrNull(output, _store.ListIndex(args[1], ParseLong(args[2])), ctx.ProtocolVersion);
 
     // ------------------------------------------------------------------
     // Sets
@@ -237,7 +237,11 @@ public sealed partial class CommandProcessor
     private void SetMembers(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         var members = _store.SetMembers(args[1]);
-        RespWriter.WriteArrayHeader(output, members.Count);
+        // A RESP3 set (~) instead of an array; RESP2 keeps the array.
+        if (ctx.ProtocolVersion >= 3)
+            RespWriter.WriteSetHeader(output, members.Count);
+        else
+            RespWriter.WriteArrayHeader(output, members.Count);
         foreach (var member in members)
             RespWriter.WriteBulkString(output, member);
     }
@@ -268,7 +272,7 @@ public sealed partial class CommandProcessor
     }
 
     private void HashGet(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects) =>
-        RespWriter.WriteBulkStringOrNull(output, _store.HashGet(args[1], args[2]));
+        RespWriter.WriteBulkStringOrNull(output, _store.HashGet(args[1], args[2]), ctx.ProtocolVersion);
 
     private void HashDelete(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
@@ -281,7 +285,11 @@ public sealed partial class CommandProcessor
     private void HashGetAll(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         var pairs = _store.HashGetAll(args[1]);
-        RespWriter.WriteArrayHeader(output, pairs.Count * 2);
+        // A RESP3 map (%) of field→value; RESP2 keeps the flat array.
+        if (ctx.ProtocolVersion >= 3)
+            RespWriter.WriteMapHeader(output, pairs.Count);
+        else
+            RespWriter.WriteArrayHeader(output, pairs.Count * 2);
         foreach (var (field, value) in pairs)
         {
             RespWriter.WriteBulkString(output, field);
@@ -351,7 +359,11 @@ public sealed partial class CommandProcessor
         effects.Add(args);
         if (increment)
         {
-            if (result.IncrementScore is { } newScore)
+            // A RESP3 double (or _) for the new score; RESP2 keeps the
+            // bulk-string form.
+            if (ctx.ProtocolVersion >= 3)
+                RespWriter.WriteDoubleOrNull(output, result.IncrementScore, ctx.ProtocolVersion);
+            else if (result.IncrementScore is { } newScore)
                 RespWriter.WriteBulkString(output, RedisStore.FormatDouble(newScore));
             else
                 RespWriter.WriteNullBulkString(output);
@@ -362,9 +374,29 @@ public sealed partial class CommandProcessor
         }
     }
 
+    private void ZIncrBy(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
+    {
+        if (!RedisStore.TryParseDouble(args[2], out var delta))
+            throw ValueErrorException.NotAFloat();
+        var result = _store.ZAdd(args[1], ZAddMode.None, false, increment: true,
+            new[] { (delta, args[3]) });
+        effects.Add(args);
+        if (ctx.ProtocolVersion >= 3)
+            RespWriter.WriteDoubleOrNull(output, result.IncrementScore, ctx.ProtocolVersion);
+        else if (result.IncrementScore is { } newScore)
+            RespWriter.WriteBulkString(output, RedisStore.FormatDouble(newScore));
+        else
+            RespWriter.WriteNullBulkString(output);
+    }
+
     private void ZScore(byte[][] args, ClientContext ctx, IBufferWriter<byte> output, List<byte[][]> effects)
     {
         var score = _store.ZScore(args[1], args[2]);
+        if (ctx.ProtocolVersion >= 3)
+        {
+            RespWriter.WriteDoubleOrNull(output, score, ctx.ProtocolVersion);
+            return;
+        }
         if (score is { } value)
             RespWriter.WriteBulkString(output, RedisStore.FormatDouble(value));
         else
@@ -381,6 +413,20 @@ public sealed partial class CommandProcessor
             withScores = true;
         }
         var range = _store.ZRange(args[1], ParseLong(args[2]), ParseLong(args[3]));
+        if (withScores && ctx.ProtocolVersion >= 3)
+        {
+            // RESP3 nests each (member, score) pair in its own array,
+            // with the score as a double; RESP2 flattens them into bulk
+            // strings.
+            RespWriter.WriteArrayHeader(output, range.Count);
+            foreach (var (member, score) in range)
+            {
+                RespWriter.WriteArrayHeader(output, 2);
+                RespWriter.WriteBulkString(output, member);
+                RespWriter.WriteDouble(output, score);
+            }
+            return;
+        }
         RespWriter.WriteArrayHeader(output, withScores ? range.Count * 2 : range.Count);
         foreach (var (member, score) in range)
         {
@@ -410,7 +456,7 @@ public sealed partial class CommandProcessor
         foreach (var channel in Tail(args, 1))
         {
             _hub.Subscribe(ctx, channel);
-            WriteSubscriptionReply(output, "subscribe", channel, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "subscribe", channel, ctx.SubscriptionCount, ctx);
         }
     }
 
@@ -419,7 +465,7 @@ public sealed partial class CommandProcessor
         foreach (var pattern in Tail(args, 1))
         {
             _hub.SubscribePattern(ctx, pattern);
-            WriteSubscriptionReply(output, "psubscribe", pattern, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "psubscribe", pattern, ctx.SubscriptionCount, ctx);
         }
     }
 
@@ -428,13 +474,13 @@ public sealed partial class CommandProcessor
         var targets = args.Length > 1 ? Tail(args, 1) : ctx.Channels.ToList();
         if (targets.Count == 0)
         {
-            WriteSubscriptionReply(output, "unsubscribe", null, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "unsubscribe", null, ctx.SubscriptionCount, ctx);
             return;
         }
         foreach (var channel in targets)
         {
             _hub.Unsubscribe(ctx, channel);
-            WriteSubscriptionReply(output, "unsubscribe", channel, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "unsubscribe", channel, ctx.SubscriptionCount, ctx);
         }
     }
 
@@ -443,19 +489,20 @@ public sealed partial class CommandProcessor
         var targets = args.Length > 1 ? Tail(args, 1) : ctx.Patterns.ToList();
         if (targets.Count == 0)
         {
-            WriteSubscriptionReply(output, "punsubscribe", null, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "punsubscribe", null, ctx.SubscriptionCount, ctx);
             return;
         }
         foreach (var pattern in targets)
         {
             _hub.UnsubscribePattern(ctx, pattern);
-            WriteSubscriptionReply(output, "punsubscribe", pattern, ctx.SubscriptionCount);
+            WriteSubscriptionReply(output, "punsubscribe", pattern, ctx.SubscriptionCount, ctx);
         }
     }
 
-    private static void WriteSubscriptionReply(IBufferWriter<byte> output, string kind, byte[]? target, long count)
+    private void WriteSubscriptionReply(IBufferWriter<byte> output, string kind, byte[]? target, long count, ClientContext ctx)
     {
-        RespWriter.WriteArrayHeader(output, 3);
+        // A push (>) in RESP3, an array in RESP2.
+        RespWriter.WritePushOrArrayHeader(output, 3, ctx.ProtocolVersion);
         RespWriter.WriteBulkString(output, kind);
         RespWriter.WriteBulkStringOrNull(output, target);
         RespWriter.WriteInteger(output, count);

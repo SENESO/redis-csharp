@@ -150,6 +150,9 @@ internal sealed class TestClient
                 return true;
             }
             case '*':
+            case '~':
+            case '>':
+            case '%':
             {
                 if (!TryReadLine(start + 1, out var line, out var next))
                     return false;
@@ -160,9 +163,12 @@ internal sealed class TestClient
                     consumed = next - start;
                     return true;
                 }
-                var items = new List<object?>(count);
+                // Maps parse to a flattened list of 2n items (key, value,
+                // key, value, ...); sets and pushes parse like arrays.
+                var total = type == '%' ? count * 2 : count;
+                var items = new List<object?>(total);
                 var cursor = next;
-                for (var i = 0; i < count; i++)
+                for (var i = 0; i < total; i++)
                 {
                     if (!TryParseReply(cursor, out var item, out var itemLength))
                         return false;
@@ -171,6 +177,47 @@ internal sealed class TestClient
                 }
                 value = items;
                 consumed = cursor - start;
+                return true;
+            }
+            case ',':
+            {
+                if (!TryReadLine(start + 1, out var line, out var next))
+                    return false;
+                value = line switch
+                {
+                    "inf" => double.PositiveInfinity,
+                    "-inf" => double.NegativeInfinity,
+                    _ => double.Parse(line, System.Globalization.CultureInfo.InvariantCulture)
+                };
+                consumed = next - start;
+                return true;
+            }
+            case '_':
+            {
+                if (!TryReadLine(start + 1, out _, out var next))
+                    return false;
+                value = null;
+                consumed = next - start;
+                return true;
+            }
+            case '=':
+            {
+                if (!TryReadLine(start + 1, out var line, out var next))
+                    return false;
+                var length = int.Parse(line);
+                if (_received.Count < next + length + 2)
+                    return false;
+                // Strip the 4-byte format prefix ("txt:").
+                value = Encoding.ASCII.GetString(_received.GetRange(next + 4, length - 4).ToArray());
+                consumed = next + length + 2 - start;
+                return true;
+            }
+            case '#':
+            {
+                if (!TryReadLine(start + 1, out var line, out var next))
+                    return false;
+                value = line == "t";
+                consumed = next - start;
                 return true;
             }
             default:
@@ -292,7 +339,8 @@ internal sealed class SessionHarness : IAsyncDisposable
     public PersistenceManager Persistence { get; }
     public string DataDirectory => _dataDirectory;
 
-    public static SessionHarness Start(bool appendOnly = false, string? requirePass = null)
+    public static SessionHarness Start(bool appendOnly = false, string? requirePass = null,
+        long maxMemory = 0, MaxMemoryPolicy maxMemoryPolicy = MaxMemoryPolicy.NoEviction)
     {
         var clock = new FakeTimeProvider();
         var stats = new RedisStats();
@@ -307,7 +355,8 @@ internal sealed class SessionHarness : IAsyncDisposable
         };
         var persistence = new PersistenceManager(options, NullLogger<PersistenceManager>.Instance);
         var hub = new PubSubHub();
-        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0, requirePass: requirePass);
+        var processor = new CommandProcessor(store, stats, clock, persistence, hub, port: 0,
+            requirePass: requirePass, maxMemory: maxMemory, maxMemoryPolicy: maxMemoryPolicy);
         return new SessionHarness(store, stats, clock, processor, hub, persistence, directory);
     }
 

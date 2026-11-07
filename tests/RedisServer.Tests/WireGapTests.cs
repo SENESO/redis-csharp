@@ -399,6 +399,27 @@ public class WireGapTests
     }
 
     [Fact]
+    public async Task ZAdd_DeclinedIncrOnAMissingKey_CreatesNothing()
+    {
+        // Real Redis: ZADD k INCR XX on a missing key answers nil and
+        // the key does not exist afterwards; the first implementation
+        // left an empty zset behind (TYPE said zset, DBSIZE counted it).
+        await using var h = SessionHarness.Start();
+        var c = h.Connect();
+
+        await c.SendCommandAsync("ZADD", "phantom", "INCR", "XX", "1", "m");
+        await c.ExpectAsync("$-1\r\n");
+        await c.SendCommandAsync("TYPE", "phantom");
+        await c.ExpectAsync("+none\r\n");
+        await c.SendCommandAsync("DBSIZE");
+        await c.ExpectAsync(":0\r\n");
+        await c.SendCommandAsync("ZINCRBY", "fresh", "2.5", "m");
+        await c.ExpectAsync("$3\r\n2.5\r\n");
+        await c.SendCommandAsync("TYPE", "fresh");
+        await c.ExpectAsync("+zset\r\n");
+    }
+
+    [Fact]
     public async Task Quit_RepliesOk_ThenClosesTheConnection()
     {
         await using var h = SessionHarness.Start();

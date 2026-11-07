@@ -27,6 +27,8 @@ public sealed class RedisSession
     private readonly ClientContext _context = new();
     private readonly Channel<byte[]> _outbound = Channel.CreateUnbounded<byte[]>();
 
+    private static long _nextConnectionId;
+
     public RedisSession(IDuplexPipe transport, CommandProcessor processor, PubSubHub hub,
         RedisStats stats, ILogger? logger = null)
     {
@@ -35,6 +37,7 @@ public sealed class RedisSession
         _hub = hub;
         _stats = stats;
         _logger = logger ?? NullLogger.Instance;
+        _context.Id = Interlocked.Increment(ref _nextConnectionId);
         _context.PostFrame = frame => _outbound.Writer.TryWrite(frame);
     }
 

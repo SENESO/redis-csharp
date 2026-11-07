@@ -45,12 +45,152 @@ public enum SetOutcome
 /// <see cref="TimeProvider"/> so tests drive it with a fake clock) plus an
 /// active sweep driven by <see cref="RunMaintenance"/>.
 /// </summary>
+/// <summary>Eviction policies for the --maxmemory ceiling (the LFU family is not implemented).</summary>
+public enum MaxMemoryPolicy
+{
+    NoEviction,
+    AllKeysLru,
+    AllKeysRandom,
+    VolatileLru,
+    VolatileRandom,
+    VolatileTtl
+}
+
 public sealed partial class RedisStore
 {
     private readonly Dictionary<byte[], RedisEntry> _data = new(ByteArrayComparer.Instance);
     private readonly object _gate = new();
     private readonly TimeProvider _clock;
     private readonly RedisStats _stats;
+
+    // ------------------------------------------------------------------
+    // Memory accounting (approximate, like Redis's own zmalloc-based
+    // figure, but data-only: this server tracks no allocator overhead).
+    // Every key carries a flat charge for its dictionary slot, entry
+    // object and expiry slot; payload bytes are counted exactly and each
+    // collection element carries a small flat charge. The counter is
+    // maintained incrementally at every mutation and can be recounted
+    // from scratch with RecalculateUsedMemory.
+    // ------------------------------------------------------------------
+
+    private const long KeyOverheadBytes = 64;
+    private const long ElementOverheadBytes = 16;
+
+    private long _usedMemory;
+    private long _accessSeq;
+    private readonly Random _evictRandom = new();
+
+    private static long CollectionElementSize(byte[] element) => ElementOverheadBytes + element.Length;
+
+    private static long ZSetElementSize(byte[] member) => ElementOverheadBytes + member.Length + sizeof(double);
+
+    private static long EstimateEntrySize(byte[] key, RedisEntry entry)
+    {
+        long size = KeyOverheadBytes + key.Length;
+        switch (entry.Type)
+        {
+            case RedisType.String:
+                size += ((byte[])entry.Value).Length;
+                break;
+            case RedisType.List:
+                foreach (var item in (LinkedList<byte[]>)entry.Value)
+                    size += CollectionElementSize(item);
+                break;
+            case RedisType.Set:
+                foreach (var member in (HashSet<byte[]>)entry.Value)
+                    size += CollectionElementSize(member);
+                break;
+            case RedisType.Hash:
+                foreach (var (field, value) in (Dictionary<byte[], byte[]>)entry.Value)
+                    size += CollectionElementSize(field) + value.Length;
+                break;
+            case RedisType.ZSet:
+                foreach (var member in ((ZSetValue)entry.Value).Scores.Keys)
+                    size += ZSetElementSize(member);
+                break;
+        }
+        return size;
+    }
+
+    /// <summary>The incrementally maintained memory estimate, in bytes.</summary>
+    public long UsedMemory
+    {
+        get { lock (_gate) return _usedMemory; }
+    }
+
+    /// <summary>Full O(n) recount of the estimate — diagnostics and tests; normal operation uses the counter.</summary>
+    public long RecalculateUsedMemory()
+    {
+        lock (_gate)
+        {
+            long total = 0;
+            foreach (var (key, entry) in _data)
+                total += EstimateEntrySize(key, entry);
+            return total;
+        }
+    }
+
+    /// <summary>
+    /// Evicts one key chosen by approximate sampling, Redis-style: a
+    /// reservoir of up to five candidates drawn from a bounded scan of
+    /// the keyspace (at most 1024 entries per call), then the policy's
+    /// victim — least recently used (access order is a store-wide
+    /// sequence stamped on every live access), soonest to expire, or the
+    /// first sample for the random policies. Volatile policies consider
+    /// only keys carrying a TTL. Returns the evicted key, or null when
+    /// no candidate exists. Runs entirely under the store gate; the
+    /// caller (the command gate) appends the DEL effect.
+    /// </summary>
+    public byte[]? TryEvictOne(MaxMemoryPolicy policy)
+    {
+        lock (_gate)
+        {
+            if (_data.Count == 0)
+                return null;
+            var volatileOnly = policy is MaxMemoryPolicy.VolatileLru or MaxMemoryPolicy.VolatileRandom
+                or MaxMemoryPolicy.VolatileTtl;
+            var sample = new (byte[] Key, RedisEntry Entry)[5];
+            var sampled = 0;
+            var seen = 0;
+            foreach (var (key, entry) in _data)
+            {
+                if (volatileOnly && entry.ExpiresAt is null)
+                    continue;
+                seen++;
+                if (sampled < sample.Length)
+                    sample[sampled++] = (key, entry);
+                else
+                {
+                    var j = _evictRandom.Next(seen);
+                    if (j < sample.Length)
+                        sample[j] = (key, entry);
+                }
+                if (seen >= 1024 && sampled == sample.Length)
+                    break;
+            }
+            if (sampled == 0)
+                return null;
+
+            var victim = sample[0];
+            for (var i = 1; i < sampled; i++)
+            {
+                var better = policy switch
+                {
+                    MaxMemoryPolicy.AllKeysLru or MaxMemoryPolicy.VolatileLru =>
+                        sample[i].Entry.LastAccess < victim.Entry.LastAccess,
+                    MaxMemoryPolicy.VolatileTtl => sample[i].Entry.ExpiresAt < victim.Entry.ExpiresAt,
+                    _ => false
+                };
+                if (better)
+                    victim = sample[i];
+            }
+
+            _data.Remove(victim.Key);
+            _usedMemory -= EstimateEntrySize(victim.Key, victim.Entry);
+            _stats.AddEvictedKey();
+            return victim.Key;
+        }
+    }
 
     public RedisStore(TimeProvider clock, RedisStats stats)
     {
@@ -63,6 +203,9 @@ public sealed partial class RedisStore
         public required RedisType Type;
         public required object Value;
         public DateTimeOffset? ExpiresAt;
+
+        /// <summary>Store-wide access sequence stamp, the basis of approximate-LRU eviction.</summary>
+        public long LastAccess;
     }
 
     /// <summary>Holds the store lock across a composite operation. Dispose to release.</summary>
@@ -88,9 +231,11 @@ public sealed partial class RedisStore
         if (entry.ExpiresAt is { } expiry && expiry <= _clock.GetUtcNow())
         {
             _data.Remove(key);
+            _usedMemory -= EstimateEntrySize(key, entry);
             _stats.AddExpiredKey();
             return null;
         }
+        entry.LastAccess = ++_accessSeq;
         return entry;
     }
 
@@ -100,7 +245,9 @@ public sealed partial class RedisStore
         if (entry is null)
         {
             entry = new RedisEntry { Type = type, Value = factory() };
+            entry.LastAccess = ++_accessSeq;
             _data[key] = entry;
+            _usedMemory += EstimateEntrySize(key, entry);
             return entry;
         }
         if (entry.Type != type)
@@ -130,7 +277,10 @@ public sealed partial class RedisStore
             _ => false
         };
         if (empty)
+        {
             _data.Remove(key);
+            _usedMemory -= KeyOverheadBytes + key.Length;
+        }
     }
 
     private int PurgeExpiredLocked()
@@ -146,6 +296,7 @@ public sealed partial class RedisStore
             return 0;
         foreach (var key in dead)
         {
+            _usedMemory -= EstimateEntrySize(key, _data[key]);
             _data.Remove(key);
             _stats.AddExpiredKey();
         }
@@ -179,7 +330,12 @@ public sealed partial class RedisStore
                     ? _clock.GetUtcNow() + span
                     : null;
 
-            _data[key] = new RedisEntry { Type = RedisType.String, Value = value, ExpiresAt = expiresAt };
+            if (existing is not null)
+                _usedMemory -= EstimateEntrySize(key, existing);
+            var entry = new RedisEntry { Type = RedisType.String, Value = value, ExpiresAt = expiresAt };
+            entry.LastAccess = ++_accessSeq;
+            _data[key] = entry;
+            _usedMemory += EstimateEntrySize(key, entry);
             return SetOutcome.Stored;
         }
     }
@@ -203,6 +359,7 @@ public sealed partial class RedisStore
             current.CopyTo(combined, 0);
             suffix.CopyTo(combined, current.Length);
             entry.Value = combined;
+            _usedMemory += suffix.Length;
             return combined.Length;
         }
     }
@@ -235,7 +392,9 @@ public sealed partial class RedisStore
                 throw ValueErrorException.Overflow();
             }
 
-            entry.Value = Encoding.ASCII.GetBytes(next.ToString(CultureInfo.InvariantCulture));
+            var bytes = Encoding.ASCII.GetBytes(next.ToString(CultureInfo.InvariantCulture));
+            _usedMemory += bytes.Length - ((byte[])entry.Value).Length;
+            entry.Value = bytes;
             return next;
         }
     }
@@ -333,8 +492,9 @@ public sealed partial class RedisStore
             long removed = 0;
             foreach (var key in keys)
             {
-                if (GetLiveEntry(key) is not null)
+                if (GetLiveEntry(key) is { } entry)
                 {
+                    _usedMemory -= EstimateEntrySize(key, entry);
                     _data.Remove(key);
                     removed++;
                 }
@@ -378,6 +538,7 @@ public sealed partial class RedisStore
                 return false;
             if (when <= _clock.GetUtcNow())
             {
+                _usedMemory -= EstimateEntrySize(key, entry);
                 _data.Remove(key);
                 removedKey = true;
                 return true;
@@ -486,7 +647,10 @@ public sealed partial class RedisStore
     public void FlushAll()
     {
         lock (_gate)
+        {
             _data.Clear();
+            _usedMemory = 0;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -501,7 +665,10 @@ public sealed partial class RedisStore
             var entry = GetOrCreate(key, RedisType.List, () => new LinkedList<byte[]>());
             var list = (LinkedList<byte[]>)entry.Value;
             foreach (var value in values)
+            {
                 list.AddFirst(value);
+                _usedMemory += CollectionElementSize(value);
+            }
             return list.Count;
         }
     }
@@ -513,7 +680,10 @@ public sealed partial class RedisStore
             var entry = GetOrCreate(key, RedisType.List, () => new LinkedList<byte[]>());
             var list = (LinkedList<byte[]>)entry.Value;
             foreach (var value in values)
+            {
                 list.AddLast(value);
+                _usedMemory += CollectionElementSize(value);
+            }
             return list.Count;
         }
     }
@@ -528,6 +698,7 @@ public sealed partial class RedisStore
             var list = (LinkedList<byte[]>)entry.Value;
             var value = list.First!.Value;
             list.RemoveFirst();
+            _usedMemory -= CollectionElementSize(value);
             RemoveIfEmpty(key, entry);
             return value;
         }
@@ -543,6 +714,7 @@ public sealed partial class RedisStore
             var list = (LinkedList<byte[]>)entry.Value;
             var value = list.Last!.Value;
             list.RemoveLast();
+            _usedMemory -= CollectionElementSize(value);
             RemoveIfEmpty(key, entry);
             return value;
         }
@@ -561,6 +733,7 @@ public sealed partial class RedisStore
             for (var i = 0; i < take; i++)
             {
                 result.Add(list.First!.Value);
+                _usedMemory -= CollectionElementSize(list.First!.Value);
                 list.RemoveFirst();
             }
             RemoveIfEmpty(key, entry);
@@ -581,6 +754,7 @@ public sealed partial class RedisStore
             for (var i = 0; i < take; i++)
             {
                 result.Add(list.Last!.Value);
+                _usedMemory -= CollectionElementSize(list.Last!.Value);
                 list.RemoveLast();
             }
             RemoveIfEmpty(key, entry);

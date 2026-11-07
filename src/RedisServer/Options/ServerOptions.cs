@@ -1,3 +1,4 @@
+using RedisServer.Core;
 using RedisServer.Persistence;
 
 namespace RedisServer.Options;
@@ -20,6 +21,11 @@ namespace RedisServer.Options;
 /// required when <c>--tls-port</c> is set</item>
 /// <item><c>--tls-cert-password &lt;password&gt;</c> — password for the certificate file (default: the
 /// <c>REDIS_TLS_CERT_PASSWORD</c> environment variable, so the secret need not appear in the process list)</item>
+/// <item><c>--maxmemory &lt;bytes&gt;</c> — memory ceiling for the dataset (default 0: no limit). Accepts
+/// Redis's size suffixes: k = 1000, kb = 1024, m/mb, g/gb likewise</item>
+/// <item><c>--maxmemory-policy &lt;name&gt;</c> — eviction policy at the ceiling: noeviction (default),
+/// allkeys-lru, allkeys-random, volatile-lru, volatile-random, volatile-ttl (the LFU family is not
+/// implemented and is refused at startup)</item>
 /// </list>
 /// </summary>
 public sealed class ServerOptions
@@ -50,6 +56,46 @@ public sealed class ServerOptions
     /// <summary>Password for the TLS certificate file, when it has one.</summary>
     public string? TlsCertPassword { get; init; }
 
+    /// <summary>Dataset memory ceiling in bytes; 0 means no limit.</summary>
+    public long MaxMemory { get; init; }
+
+    /// <summary>Eviction policy applied when the dataset is over <see cref="MaxMemory"/>.</summary>
+    public MaxMemoryPolicy MaxMemoryPolicy { get; init; } = MaxMemoryPolicy.NoEviction;
+
+    /// <summary>
+    /// Redis's human size grammar: an optional suffix scales the number —
+    /// k = 1000, kb = 1024, m = 1000^2, mb = 1024^2, g = 1000^3,
+    /// gb = 1024^3; no suffix means bytes.
+    /// </summary>
+    public static long ParseMemorySize(string text)
+    {
+        var s = text.Trim().ToLowerInvariant();
+        long multiplier = 1;
+        if (s.EndsWith("kb")) { multiplier = 1024; s = s[..^2]; }
+        else if (s.EndsWith("mb")) { multiplier = 1024L * 1024; s = s[..^2]; }
+        else if (s.EndsWith("gb")) { multiplier = 1024L * 1024 * 1024; s = s[..^2]; }
+        else if (s.EndsWith("k")) { multiplier = 1000; s = s[..^1]; }
+        else if (s.EndsWith("m")) { multiplier = 1000L * 1000; s = s[..^1]; }
+        else if (s.EndsWith("g")) { multiplier = 1000L * 1000 * 1000; s = s[..^1]; }
+        if (!long.TryParse(s, out var value) || value < 0)
+            throw new ArgumentException($"Invalid --maxmemory value '{text}'.");
+        return checked(value * multiplier);
+    }
+
+    /// <summary>Parses a --maxmemory-policy name; anything outside the implemented set fails startup loudly.</summary>
+    public static MaxMemoryPolicy ParseMaxMemoryPolicy(string text) => text.Trim().ToLowerInvariant() switch
+    {
+        "noeviction" => MaxMemoryPolicy.NoEviction,
+        "allkeys-lru" => MaxMemoryPolicy.AllKeysLru,
+        "allkeys-random" => MaxMemoryPolicy.AllKeysRandom,
+        "volatile-lru" => MaxMemoryPolicy.VolatileLru,
+        "volatile-random" => MaxMemoryPolicy.VolatileRandom,
+        "volatile-ttl" => MaxMemoryPolicy.VolatileTtl,
+        var other => throw new ArgumentException(
+            $"Unsupported --maxmemory-policy '{other}'. Supported: noeviction, allkeys-lru, allkeys-random, " +
+            "volatile-lru, volatile-random, volatile-ttl (the LFU policies are not implemented).")
+    };
+
     public static ServerOptions FromArgs(string[] args)
     {
         var port = DefaultPort;
@@ -59,6 +105,8 @@ public sealed class ServerOptions
         var appendFileName = "appendonly.aof";
         var appendFsync = AofFsyncPolicy.EverySec;
         var requirePass = Environment.GetEnvironmentVariable("REDIS_REQUIREPASS");
+        var maxMemory = 0L;
+        var maxMemoryPolicy = MaxMemoryPolicy.NoEviction;
         var tlsPort = 0;
         var tlsCertFile = (string?)null;
         var tlsCertPassword = Environment.GetEnvironmentVariable("REDIS_TLS_CERT_PASSWORD");
@@ -85,6 +133,12 @@ public sealed class ServerOptions
                     break;
                 case "--requirepass":
                     requirePass = value;
+                    break;
+                case "--maxmemory":
+                    maxMemory = ParseMemorySize(value);
+                    break;
+                case "--maxmemory-policy":
+                    maxMemoryPolicy = ParseMaxMemoryPolicy(value);
                     break;
                 case "--tls-port" when int.TryParse(value, out var parsedTlsPort):
                     tlsPort = parsedTlsPort;
@@ -115,6 +169,8 @@ public sealed class ServerOptions
             AppendFileName = appendFileName,
             AppendFsync = appendFsync,
             RequirePass = string.IsNullOrEmpty(requirePass) ? null : requirePass,
+            MaxMemory = maxMemory,
+            MaxMemoryPolicy = maxMemoryPolicy,
             TlsPort = tlsPort,
             TlsCertFile = tlsCertFile,
             TlsCertPassword = tlsCertPassword
