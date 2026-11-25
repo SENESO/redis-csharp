@@ -1,5 +1,7 @@
 # Redis Server in C#
 
+[![ci](https://github.com/SENESO/redis-csharp/actions/workflows/ci.yml/badge.svg)](https://github.com/SENESO/redis-csharp/actions/workflows/ci.yml)
+
 A complete, from-scratch implementation of a Redis-compatible server in C# on .NET 8 — the RESP2 and RESP3 wire protocols (`HELLO` negotiation), all five core data types, transactions, pub/sub, memory limits with eviction (LRU, LFU, random, TTL), both of Redis's persistence models (snapshots and an append-only file), primary/replica replication, 16 logical databases, ACL users, Lua scripting, and a static-map cluster mode, served over `System.IO.Pipelines`.
 
 It speaks the real Redis wire protocol, so standard Redis clients can drive it.
